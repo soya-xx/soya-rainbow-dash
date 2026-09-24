@@ -1,0 +1,1650 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Soya Rainbow Dash</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hidden;
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;overscroll-behavior:none}
+canvas{display:block;image-rendering:crisp-edges;image-rendering:pixelated;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<script>
+'use strict';
+var GAME = (function () {
+/* 逻辑坐标沿用原版 160x90：手感、判定、关卡数据都以它为单位。
+   画面按 R 倍像素密度绘制（320x180），所有绘制函数把逻辑坐标乘 R 后取整。 */
+var W = 160, H = 90, R = 2, FW = W * R, FH = H * R;
+
+/* ================= 调色板（64 色） ================= */
+var HEX = [
+  '#000000', '#08081a', '#100d2a', '#1a1440', '#261a54', '#3a2168', '#56508f', '#ffffff', // 0-7 宇宙·星·白
+  '#cd7b5e', '#f5b08c', '#8e4a38',                                                        // 8-10 暖色（粒子）
+  '#e83b3b', '#f58a2a', '#f7d83a', '#4ccb5a', '#3cd0e6', '#4468ea', '#a44ee4',            // 11-17 彩虹
+  '#6e1826', '#7e3a14', '#7a6414', '#1a5a2a', '#145a70', '#1c2a7a', '#4a1e72',            // 18-24 彩虹暗色
+  '#9a8c86', '#625662', '#362a3c', '#ffd46a', '#ff5a1e', '#a8fcff', '#ff3cd2',            // 25-31 岩石·熔岩·光束
+  '#fff3d6', '#f2d39f', '#d6a974', '#8a5a3c', '#a87652',                                  // 32-36 Soya 发色 高光/主/暗/深/尾尖
+  '#ffe8dc', '#f5c3b1', '#ff9fae',                                                        // 37-39 皮肤/阴影/腮红
+  '#20478f', '#4cc3f0',                                                                   // 40-41 蓝眼
+  '#dcdcf0', '#9a94bd',                                                                   // 42-43 白色阴影/白色描边
+  '#f78fb6', '#ffc9dc', '#c9588a',                                                        // 44-46 粉
+  '#9aeaf4', '#45aacc',                                                                   // 47-48 浅蓝缎带
+  '#6e4860', '#432a3c',                                                                   // 49-50 裙子/腰带
+  '#2a1d33', '#e6ebf5', '#f6a2b9', '#b8466d',                                             // 51-54 项圈/铃铛/耳内/嘴
+  '#c98a7e', '#9e3a68', '#2f86a8', '#2a1826', '#5a3828', '#122a5c', '#6a7088', '#8e3560', '#ffe28a' // 55-63 描边
+];
+var NPAL = HEX.length;
+var C_BLACK = 0, C_WHITE = 7, C_STAR = 6,
+    HUE = 11, HUED = 18,
+    C_ROCKL = 25, C_ROCKM = 26, C_ROCKD = 27, C_LAVAH = 28, C_LAVA = 29, C_BCYAN = 30, C_MAG = 31, C_CYAN = 15;
+var PAL = new Uint32Array(NPAL), LUM = new Float32Array(NPAL);
+var LITTLE = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+(function () {
+  for (var i = 0; i < NPAL; i++) {
+    var v = parseInt(HEX[i].slice(1), 16), r = (v >> 16) & 255, g = (v >> 8) & 255, b = v & 255;
+    PAL[i] = LITTLE ? (((255 << 24) | (b << 16) | (g << 8) | r) >>> 0) : (((r << 24) | (g << 16) | (b << 8) | 255) >>> 0);
+    LUM[i] = r * 0.3 + g * 0.59 + b * 0.11;
+  }
+})();
+var fb = new Uint32Array(FW * FH);
+var BAYER = new Uint8Array([0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]);
+var SHAKE = new Int8Array([1, 0, -1, 1, 1, -1, -1, 0, 0, 1, 1, 1, -1, -1, 0, -1, 1, 0, -1, 1]); // 固定抖动模式
+var JIT = new Int8Array([0, 1, 0, -1, 1, 0, -1, 0]);
+
+/* ================= 常量 ================= */
+var A_JUMP = 1, A_JUMP2 = 2, A_DJ = 3, A_SLIDE = 4, A_DASH = 5;
+var GS_TITLE = 0, GS_PLAY = 1, GS_DYING = 2, GS_OVER = 3;
+var CXC = 58, FLOOR_BASE = 64;                               // 角色中心 x、地板基准高度（逻辑坐标）
+var G = 0.28, JV = 3.6, DJV = 3.3, DJ_FREEZE = 3;
+var DASH_SURGE = 6, DASH_MAXHOLD = 36, DASH_RET = 40, DASH_IFRAMES = 12, DASH_CD = 20;
+var BOOST_LEN = 80, WARP_RESET = 3, WARP_LEN = 40;
+var STRIPE = [4, 4, 2, 4, 2, 4, 4], FLOOR_T = 12;            // 地板彩虹带（画面像素）与厚度（逻辑单位）
+var GAP = -9999;
+
+/* ================= 攻击模式 =================
+   ['M', 通过时刻, 相对角色中心x, 相对地面y, vx, vy, 半径]      陨石：在“通过时刻”经过角色站立处
+   ['B', 预告开始, 预告时长, 照射时长, 角色中心处y, 斜率, 粗细]   光束
+   ['F', 唇口抵达时刻, 跳台长, 跳台高, 断裂长]                    地板跳台/断裂
+   Soya 比原来的方块角色高，“滑铲钻过”的高位光束从 -8 抬到 -9：站着会打中额头，扑地滑行只擦到耳尖的光晕。 */
+var PATTERNS = [
+  { len: 120, it: [['M', 60, 0, -8, -3.6, 0.9, 5]] },                                                     // 0 陨石单发
+  { len: 160, it: [['M', 60, 0, -5, -3.0, 1.3, 3], ['M', 68, -2, -4, -3.4, 1.5, 3], ['M', 77, 0, -9, -3.1, 1.2, 5]] }, // 1 三连
+  { len: 120, it: [['B', 0, 30, 26, -3, 0, 5]] },                                                         // 2 低位光束
+  { len: 120, it: [['B', 0, 30, 24, -9, 0, 5]] },                                                         // 3 高位光束
+  { len: 110, it: [['B', 0, 30, 24, -4, -0.45, 4], ['M', 36, 0, -8, -3.2, 1.4, 5]] },                     // 4 斜光束+陨石
+  { len: 140, it: [['F', 72, 30, 6, 36], ['M', 102, 0, -13, -2.8, 0.5, 9]] },                             // 5 跳台断裂+大陨石
+  { len: 100, it: [['F', 60, 0, 0, 30]] },                                                                // 6 断裂
+  { len: 120, it: [['M', 60, 0, -9, -4.0, 0.6, 3], ['M', 84, 0, -9, -4.2, 0.5, 5]] },                     // 7 低空飞掠
+  { len: 130, it: [['B', 0, 30, 20, -3, 0, 5], ['B', 46, 28, 22, -9, 0, 5]] },                            // 8 光束夹击
+  { len: 130, it: [['F', 56, 0, 0, 28], ['M', 80, 0, -8, -3.4, 0.9, 5]] }                                 // 9 断裂+陨石
+];
+var NPAT = PATTERNS.length;
+function stageBase(s) { return Math.min(2.4 + 0.3 * s, 4.3); }
+function stageVF(s) { return Math.min(1 + 0.07 * s, 1.45); }
+function stageTS(s) { return Math.max(0.72, 1 - 0.06 * s); }
+
+/* 对象池 */
+var MM = 16, BM = 6, FM = 3;
+var mAct = new Uint8Array(MM), mTp = new Float64Array(MM), mPrx = new Float64Array(MM), mPry = new Float64Array(MM),
+    mVx = new Float64Array(MM), mVy = new Float64Array(MM), mR = new Int32Array(MM), mSpawn = new Int32Array(MM),
+    mX = new Float64Array(MM), mY = new Float64Array(MM), mPrev = new Float64Array(MM), mNear = new Uint8Array(MM),
+    mOrd = new Int32Array(MM), mShook = new Uint8Array(MM);
+var bAct = new Uint8Array(BM), bWarn = new Int32Array(BM), bFire = new Int32Array(BM), bDur = new Int32Array(BM),
+    bY0 = new Float64Array(BM), bSl = new Float64Array(BM), bTh = new Int32Array(BM), bNear = new Uint8Array(BM),
+    bOrd = new Int32Array(BM);
+var fAct = new Uint8Array(FM), fX0 = new Int32Array(FM), fRL = new Int32Array(FM), fRH = new Int32Array(FM), fGL = new Int32Array(FM);
+var patMin = new Float64Array(16);
+var seqArr = new Int8Array(12), seqLen = 0;
+
+/* 标题画面自动演示：第 1 关按固定动作表躲避（启动时求解最险时机） */
+// 类型, 搜索起, 搜索止, 参数(二段跳延迟/滑行时长/冲刺停留), 负责到第几个攻击模式, 评估截止
+var ACT_DEF = [
+  [A_JUMP, 95, 132, 0, 0, 160],
+  [A_DASH, 200, 252, 26, 1, 295],
+  [A_JUMP2, 340, 382, 15, 2, 420],
+  [A_SLIDE, 460, 502, 34, 3, 540],
+  [A_DASH, 580, 622, 34, 4, 660],
+  [A_JUMP, 728, 771, 0, 4, 830],
+  [A_DJ, 776, 810, 0, 5, 835]
+];
+var NA = ACT_DEF.length;
+var aType = new Int32Array(NA), aWinS = new Int32Array(NA), aWinE = new Int32Array(NA), aParam = new Int32Array(NA),
+    aOrd = new Int32Array(NA), aEval = new Int32Array(NA), aStart = new Int32Array(NA);
+(function () {
+  for (var i = 0; i < NA; i++) {
+    var d = ACT_DEF[i];
+    aType[i] = d[0]; aWinS[i] = d[1]; aWinE[i] = d[2]; aParam[i] = d[3]; aOrd[i] = d[4]; aEval[i] = d[5]; aStart[i] = -1;
+  }
+})();
+
+/* ================= 工具 ================= */
+function hash(n) {
+  n = (n | 0) + 0x9e3779b9;
+  n = Math.imul(n ^ (n >>> 16), 0x45d9f3b);
+  n = Math.imul(n ^ (n >>> 16), 0x45d9f3b);
+  n = n ^ (n >>> 16);
+  return (n >>> 0) / 4294967296;
+}
+function pset(x, y, c) { if (x >= 0 && x < FW && y >= 0 && y < FH) fb[y * FW + x] = PAL[c]; }
+function hline(x0, x1, y, c) {
+  if (y < 0 || y >= FH) return;
+  if (x0 < 0) x0 = 0; if (x1 > FW) x1 = FW;
+  var p = PAL[c], o = y * FW;
+  for (var x = x0; x < x1; x++) fb[o + x] = p;
+}
+
+/* ================= 地板形状（半个逻辑单位精度，和画面像素一一对应） ================= */
+function wave(wx) { return 2 * Math.sin(wx * 0.019) + 1.3 * Math.sin(wx * 0.043 + 1.1); }
+function baseSurf(wx) { return FLOOR_BASE + Math.round(wave(wx) * R) / R; }
+function rampH(wx) {                       // 跳台高度（>=0）或 GAP
+  for (var f = 0; f < FM; f++) {
+    if (!fAct[f]) continue;
+    var u = wx - fX0[f];
+    if (u < 0 || u >= fRL[f] + fGL[f]) continue;
+    if (u < fRL[f]) return Math.round(fRH[f] * (1 - Math.cos(u / fRL[f] * Math.PI * 0.5)) * R) / R;
+    return GAP;
+  }
+  return 0;
+}
+
+/* ================= 预渲染：背景渐变（抖动色带） ================= */
+var bgBuf = new Uint32Array(FW * FH);
+(function () {
+  var SY = [0, 32, 68, 104, 136, 180], SC = [0, 1, 2, 3, 4, 2];
+  for (var y = 0; y < FH; y++) {
+    var s = 0;
+    while (s < SY.length - 2 && y >= SY[s + 1]) s++;
+    var f = (y - SY[s]) / (SY[s + 1] - SY[s]);
+    for (var x = 0; x < FW; x++) {
+      var c = f * 16 > BAYER[(y & 3) * 4 + (x & 3)] ? SC[s + 1] : SC[s];
+      bgBuf[y * FW + x] = PAL[c];
+    }
+  }
+})();
+
+/* 星云（点阵 + 抖动） */
+var NEB_W = 128, NEB_H = 56, nebSpr = new Uint8Array(NEB_W * NEB_H);
+(function () {
+  var cols = [255, 3, 4, 5];
+  for (var y = 0; y < NEB_H; y++) for (var x = 0; x < NEB_W; x++) {
+    var wx = (x + 0.5) / R, wy = (y + 0.5) / R, nx = (wx - 32) / 32, ny = (wy - 14) / 14;
+    var v = (1 - (nx * nx + ny * ny)) * 1.1 + 0.45 * Math.sin(wx * 0.31 + wy * 0.22) * Math.sin(wy * 0.47 - wx * 0.12)
+          + 0.2 * Math.sin(wx * 0.83 + 1.7) * Math.cos(wy * 0.61) + 0.12 * Math.sin(wx * 1.9 + wy * 1.3);
+    var l = Math.floor(v * 2.6 + BAYER[(y & 3) * 4 + (x & 3)] / 16 - 0.4);
+    if (l < 0) l = 0; if (l > 3) l = 3;
+    nebSpr[y * NEB_W + x] = cols[l];
+  }
+})();
+
+/* 远处的大行星（带环） */
+var PL_W = 100, PL_H = 68, plSpr = new Uint8Array(PL_W * PL_H);
+(function () {
+  var RP = 13, cols = [3, 4, 5, 24];
+  for (var y = 0; y < PL_H; y++) for (var x = 0; x < PL_W; x++) {
+    var dx = (x + 0.5) / R - 25, dy = (y + 0.5) / R - 17, d2 = dx * dx + dy * dy;
+    var e = (dx * dx) / (23 * 23) + ((dy + dx * 0.18) * (dy + dx * 0.18)) / (5.5 * 5.5);
+    var ring = e > 0.74 && e < 1.0 && !(e > 0.85 && e < 0.88);   // 环中间一道细缝
+    var ringC = e < 0.86 ? C_STAR : 23;
+    var inPl = d2 <= RP * RP + 1;
+    var c = 255;
+    if (inPl) {
+      var nz = Math.sqrt(Math.max(0, 1 - d2 / (RP * RP)));
+      var l = -0.5 * dx / RP - 0.45 * dy / RP + 0.75 * nz;
+      if (((Math.floor(dy * 2) + 80) % 12) < 3) l -= 0.18;
+      var q = Math.floor(l * 3.6 + BAYER[(y & 3) * 4 + (x & 3)] / 16 - 0.3);
+      if (q < 0) q = 0; if (q > 3) q = 3;
+      c = cols[q];
+      if (ring && dy + dx * 0.18 > 0) c = ringC;          // 环的前半部分遮住行星
+    } else if (ring) c = ringC;
+    plSpr[y * PL_W + x] = c;
+  }
+})();
+
+/* 陨石精灵（画面像素）：轮廓 + 明暗 + 陨坑 + 熔岩裂纹，前进方向（左下）边缘灼烧 */
+var MSPR = [], MSPR_R = [6, 10, 18];
+(function () {
+  for (var s = 0; s < 3; s++) {
+    var r = MSPR_R[s], S = 2 * r + 1, spr = new Uint8Array(S * S), inside = new Uint8Array(S * S), x, y, i, k;
+    for (y = 0; y < S; y++) for (x = 0; x < S; x++) {
+      var dx = x - r, dy = y - r, a = Math.atan2(dy, dx);
+      var bump = (0.55 * Math.sin(a * 3 + s * 1.3) + 0.35 * Math.sin(a * 5 + 2.1 + s) + 0.18 * Math.sin(a * 9 + s)) * R;
+      if (Math.sqrt(dx * dx + dy * dy) <= r - 0.7 + (bump < 0 ? bump : 0)) inside[y * S + x] = 1;
+    }
+    for (y = 0; y < S; y++) for (x = 0; x < S; x++) {
+      i = y * S + x;
+      if (!inside[i]) { spr[i] = 255; continue; }
+      var edge = x === 0 || y === 0 || x === S - 1 || y === S - 1 || !inside[i - 1] || !inside[i + 1] || !inside[i - S] || !inside[i + S];
+      var ddx = (x - r) / r, ddy = (y - r) / r;
+      if (edge) spr[i] = (ddx < 0.2 && ddy > -0.2) ? C_LAVA : C_ROCKD;
+      else {
+        var l = -0.62 * ddx - 0.62 * ddy + BAYER[(y & 3) * 4 + (x & 3)] / 40;
+        spr[i] = l > 0.35 ? C_ROCKL : (l > -0.45 ? C_ROCKM : C_ROCKD);
+      }
+    }
+    var craters = s === 0 ? 1 : (s === 1 ? 2 : 4);                // 陨坑：暗底 + 右下亮边
+    for (k = 0; k < craters; k++) {
+      var ccx = r + (hash(s * 71 + k * 19) - 0.5) * r * 0.9, ccy = r + (hash(s * 53 + k * 29 + 5) - 0.5) * r * 0.9;
+      var cr = s === 0 ? 1.4 : 1.6 + hash(s * 13 + k) * (s === 2 ? 2.6 : 1.2);
+      for (y = Math.floor(ccy - cr - 1); y <= ccy + cr + 1; y++) for (x = Math.floor(ccx - cr - 1); x <= ccx + cr + 1; x++) {
+        if (x < 1 || y < 1 || x > S - 2 || y > S - 2) continue;
+        i = y * S + x;
+        if (!inside[i] || spr[i] === C_LAVA) continue;
+        var ex = x - ccx, ey = y - ccy, d = Math.sqrt(ex * ex + ey * ey);
+        if (d <= cr) spr[i] = C_ROCKD;
+        else if (d <= cr + 1 && ex + ey > 0) spr[i] = C_ROCKL;
+      }
+    }
+    var cracks = s === 0 ? 1 : (s === 1 ? 3 : 6), len = s === 0 ? 4 : (s === 1 ? 7 : 12);
+    for (var c = 0; c < cracks; c++) {
+      var cx = r + Math.round((hash(s * 31 + c * 7) - 0.5) * r * 0.9), cy = r + Math.round((hash(s * 17 + c * 13 + 3) - 0.5) * r * 0.9);
+      for (k = 0; k < len; k++) {
+        i = cy * S + cx;
+        if (inside[i] && spr[i] !== C_LAVA) spr[i] = (k % 3 === 1) ? C_LAVAH : C_LAVA;
+        var dir = (hash(s * 101 + c * 37 + k * 11) * 4) | 0;
+        cx += dir === 0 ? 1 : (dir === 1 ? -1 : 0);
+        cy += dir === 2 ? 1 : (dir === 3 ? -1 : 0);
+        if (cx < 1) cx = 1; if (cy < 1) cy = 1; if (cx > S - 2) cx = S - 2; if (cy > S - 2) cy = S - 2;
+      }
+    }
+    MSPR.push(spr);
+  }
+})();
+function sprIndex(r) { return r >= 9 ? 2 : (r >= 5 ? 1 : 0); }
+
+/* ================= 视差星空层（画面像素坐标） ================= */
+var FS_N = 150, fsX = new Float32Array(FS_N), fsY = new Uint8Array(FS_N), fsC = new Uint8Array(FS_N), fsP = new Uint8Array(FS_N);
+var MS_N = 24, msX = new Float32Array(MS_N), msY = new Uint8Array(MS_N);
+var SL_N = 30, slX = new Float32Array(SL_N), slY = new Uint8Array(SL_N), slL = new Float32Array(SL_N);
+var plX = 192, nbX = 36;
+(function () {
+  var i;
+  for (i = 0; i < FS_N; i++) {
+    fsX[i] = hash(i * 13 + 1) * FW; fsY[i] = (hash(i * 17 + 5) * FH) | 0;
+    var q = hash(i * 23 + 9);
+    fsC[i] = q < 0.16 ? C_WHITE : (q < 0.62 ? C_STAR : 5);
+    fsP[i] = (hash(i * 29 + 2) * 96) | 0;
+  }
+  for (i = 0; i < MS_N; i++) { msX[i] = hash(i * 41 + 7) * (FW + 32); msY[i] = 4 + ((hash(i * 43 + 1) * 168) | 0); }
+  for (i = 0; i < SL_N; i++) { slX[i] = hash(i * 47 + 3) * (FW + 160); slY[i] = 4 + ((hash(i * 53 + 5) * 168) | 0); slL[i] = 4 + hash(i * 59) * 6; }
+})();
+
+/* ================= 粒子系统（对象池，零分配；位置和速度用逻辑坐标） ================= */
+var K_SPARK = 0, K_BSPARK = 1, K_TRAIL = 2, K_DEBRIS = 3, K_RAIN = 4, K_MOTE = 5, K_GHOST = 6, K_RING = 7, K_BODY = 8;
+var PN = 2000;
+var pX = new Float32Array(PN), pY = new Float32Array(PN), pVX = new Float32Array(PN), pVY = new Float32Array(PN),
+    pG = new Float32Array(PN), pLock = new Float32Array(PN),
+    pLife = new Int16Array(PN), pMax = new Int16Array(PN),
+    pKind = new Uint8Array(PN), pHue = new Uint8Array(PN), pSz = new Uint8Array(PN), pAux = new Int32Array(PN);
+var pCursor = 0;
+// 每种粒子的颜色过渡表（调色板索引列），彩虹系按色相各一张
+var RAMPS = [];
+(function () {
+  function add(kind, fn) { for (var hh = 0; hh < 7; hh++) RAMPS[kind * 7 + hh] = new Uint8Array(fn(hh)); }
+  add(K_SPARK, function () { return [7, 13, 12, 12, 19]; });
+  add(K_BSPARK, function () { return [7, 30, 15, 22]; });
+  add(K_TRAIL, function () { return [28, 29, 29, 11, 18, 27]; });
+  add(K_DEBRIS, function () { return [25, 26, 26, 27]; });
+  add(K_RAIN, function (hh) { return [7, HUE + hh, HUE + hh, HUED + hh]; });
+  add(K_MOTE, function (hh) { return [HUE + hh, HUE + hh, HUED + hh, 3]; });
+  add(K_GHOST, function (hh) { return [HUE + hh, HUE + hh, HUED + hh, HUED + hh]; });
+  add(K_RING, function (hh) { return [HUE + hh, HUE + hh, HUED + hh]; });
+  add(K_BODY, function () { return [7]; });                     // 碎片颜色取自 Soya 身上的像素，见 drawParticles
+})();
+function emit(kind, x, y, vx, vy, life, hue, grav, lock, sz, aux) {
+  var i = pCursor, n = 0;
+  while (pLife[i] > 0 && n < PN) { i++; if (i === PN) i = 0; n++; }
+  pCursor = i + 1; if (pCursor === PN) pCursor = 0;
+  pX[i] = x; pY[i] = y; pVX[i] = vx; pVY[i] = vy; pG[i] = grav; pLock[i] = lock;
+  pLife[i] = life; pMax[i] = life; pKind[i] = kind; pHue[i] = hue; pSz[i] = sz; pAux[i] = aux;
+}
+function clearParticles() { for (var i = 0; i < PN; i++) pLife[i] = 0; }
+function updateParticles() {
+  for (var i = 0; i < PN; i++) {
+    if (pLife[i] <= 0) continue;
+    pLife[i]--;
+    pVY[i] += pG[i];
+    pX[i] += pVX[i] - spd * pLock[i];
+    pY[i] += pVY[i];
+    if (pKind[i] === K_RING) pAux[i]++;
+  }
+}
+
+/* ================= 主角 Soya：像素小人 =================
+   画面像素绘制：身体帧 + 头（同一张，眨眼时换眼睛）+ 头发链 + 猫尾链，合成后统一自动描边。
+   字符 → 颜色：H/h/d/D 头发，s/S 皮肤，b 腮红，e/E 眼睛，w/W 白，p/P/q 粉，c 浅蓝缎带，k/K 裙子，g 铃铛，r 耳内 */
+var SCH = { H: 32, h: 33, d: 34, D: 35, t: 36, s: 37, S: 38, b: 39, e: 40, E: 41, w: 7, W: 42, V: 43,
+            p: 44, P: 45, q: 46, c: 47, C: 48, k: 49, K: 50, n: 51, g: 52, r: 53, m: 54 };
+var OUTL = new Uint8Array(NPAL), DARK = new Uint8Array(NPAL);
+(function () {
+  var i;
+  for (i = 0; i < NPAL; i++) { OUTL[i] = 58; DARK[i] = 3; }
+  OUTL[32] = OUTL[33] = OUTL[34] = 35; OUTL[35] = OUTL[36] = 59;          // 头发 → 棕色描边
+  OUTL[37] = OUTL[38] = OUTL[39] = 55;                                    // 皮肤
+  OUTL[40] = 60; OUTL[41] = 40;                                           // 眼睛
+  OUTL[7] = OUTL[42] = 43;                                                // 白 → 淡紫描边
+  OUTL[44] = 56; OUTL[45] = 46; OUTL[46] = 62; OUTL[53] = 56; OUTL[54] = 62; // 粉
+  OUTL[47] = OUTL[48] = 57;                                               // 浅蓝
+  OUTL[52] = 61;                                                          // 铃铛
+  var dk = [[32, 33], [33, 34], [34, 35], [35, 59], [36, 35], [37, 38], [38, 55], [39, 55], [40, 60], [41, 40],
+            [7, 42], [42, 43], [43, 6], [44, 46], [45, 44], [46, 56], [47, 48], [48, 57], [49, 50], [50, 58],
+            [51, 58], [52, 42], [53, 44], [54, 62], [55, 5], [56, 5], [57, 22], [58, 2], [59, 27], [60, 23],
+            [61, 26], [62, 5]];
+  for (i = 0; i < dk.length; i++) DARK[dk[i][0]] = dk[i][1];
+})();
+var SPR_SRC = {
+  head: [
+    '..h..........h..',
+    '.hrh........hrh.',
+    '.hrrh.Pp.pP.hrrh',
+    '.hrrwpPpqpPpwrrh',
+    '..wWwWwwpwwWwWw.',
+    '.hhHHhhhhhhhHHh.',
+    'hhHHhhhhdhhhhHhd',
+    'hhhhdhsshsdsshhd',
+    'hhhdeeeesseeeehd',
+    'hhhdsewEssewEshd',
+    'hhhdseEEsseEEshd',
+    'hhdhsEcEssEcEshd',
+    'hhdhsbssssssbshd',
+    '.hdhhSssssssShd.',
+    '..hd.........dh.'],
+  blink: [
+    '..h..........h..',
+    '.hrh........hrh.',
+    '.hrrh.Pp.pP.hrrh',
+    '.hrrwpPpqpPpwrrh',
+    '..wWwWwwpwwWwWw.',
+    '.hhHHhhhhhhhHHh.',
+    'hhHHhhhhdhhhhHhd',
+    'hhhhdhsshsdsshhd',
+    'hhhdsssssssssshd',
+    'hhhdsseessseeshd',
+    'hhhdsessssesshhd',
+    'hhdhsssssssssshd',
+    'hhdhsbssssssbshd',
+    '.hdhhSssssssShd.',
+    '..hd.........dh.'],
+  run0: [
+    '.....pPggPp.....',
+    '...cpPPVVPPpcss.',
+    '.....pPqqPp.....',
+    '..ssKkkwwkkK....',
+    '...kkkkwwkkkk...',
+    '..kkkkkwwkkkkk..',
+    '..WwWwWwWwWwWw..',
+    '....WW....ww....',
+    '...WW......ww...',
+    '.SSS........sss.'],
+  run1: [
+    '................',
+    '.....pPggPp.....',
+    '...cpPPVVPPpc...',
+    '..ss.pPqqPp.ss..',
+    '....KkkwwkkK....',
+    '...kkkkwwkkkk...',
+    '..kkkkkwwkkkkk..',
+    '..wWwWwWwWwWwW..',
+    '..SWW.....ww....',
+    '..........sss...'],
+  run2: [
+    '.....pPggPp.....',
+    '...cpPPVVPPpc...',
+    '..ss.pPqqPp.ss..',
+    '....KkkwwkkK....',
+    '...kkkkwwkkkk...',
+    '..kkkkkwwkkkkk..',
+    '..WwWwWwWwWwWw..',
+    '......wwWW......',
+    '......ww.SS.....',
+    '.....sss........'],
+  run3: [
+    '.....pPggPp.....',
+    '.sscpPPVVPPpc...',
+    '.....pPqqPp.....',
+    '....KkkwwkkKss..',
+    '...kkkkwwkkkk...',
+    '..kkkkkwwkkkkk..',
+    '..wWwWwWwWwWwW..',
+    '....ww....WW....',
+    '...ww......WW...',
+    '.sss........SSS.'],
+  run4: [
+    '................',
+    '.....pPggPp.....',
+    '...cpPPVVPPpc...',
+    '..ss.pPqqPp.ss..',
+    '....KkkwwkkK....',
+    '...kkkkwwkkkk...',
+    '..kkkkkwwkkkkk..',
+    '..WwWwWwWwWwWw..',
+    '..sww.....WW....',
+    '..........SSS...'],
+  run5: [
+    '.....pPggPp.....',
+    '...cpPPVVPPpc...',
+    '..ss.pPqqPp.ss..',
+    '....KkkwwkkK....',
+    '...kkkkwwkkkk...',
+    '..kkkkkwwkkkkk..',
+    '..wWwWwWwWwWwW..',
+    '......WWww......',
+    '......WW.ss.....',
+    '.....SSS........'],
+  jump: [
+    '.ss..pPggPp..ss.',
+    '..scpPPVVPPpcs..',
+    '.....pPqqPp.....',
+    '....KkkwwkkK....',
+    '...kkkkwwkkkk...',
+    '..kkkkkwwkkkkk..',
+    '..WwWwWwWwWwWw..',
+    '.....WW..ww.....',
+    '....WW....ss....',
+    '...SSS..........'],
+  apex: [
+    '.....pPggPp.....',
+    '.sscpPPVVPPpcss.',
+    '.....pPqqPp.....',
+    '....KkkwwkkK....',
+    '...kkkkwwkkkk...',
+    '..kkkkkwwkkkkk..',
+    '..WwWwWwWwWwWw..',
+    '....WWW..www....',
+    '....SSS..sss....'],
+  fall: [
+    '.ss..pPggPp..ss.',
+    '..scpPPVVPPpcs..',
+    '.....pPqqPp.....',
+    '....KkkwwkkK....',
+    '...kkkkwwkkkk...',
+    '.kkkkkkwwkkkkkk.',
+    '.WwWwWwWwWwWwWw.',
+    '.....WW..ww.....',
+    '.....WW..ww.....',
+    '....SSS..sss....'],
+  tuck: [
+    '.....pPggPp.....',
+    '...cpPPVVPPpc...',
+    '...sspPqqPpss...',
+    '....KkkwwkkK....',
+    '...kkkkwwkkkk...',
+    '..kkkkkwwkkkkk..',
+    '..wWwWwWwWwWwW..',
+    '....SSSSssss....'],
+  dash: [
+    '.........pPggPp...',
+    '.......cpPPVVPPpc.',
+    '...ss....pPqqPpss.',
+    '......KkkkwwkkK...',
+    '...kkkkkkkwwkkk...',
+    '..WwkkkkkkwwkkkW..',
+    '...WwWwWwWwWwWw...',
+    '.SSWW.......ww....',
+    '...........sss....'],
+  slide: [
+    '...................................',
+    '.SS................................',
+    '..WW...............................',
+    '...WW..kkkK........................',
+    '..ss.WkkkkkKcpP....................',
+    '...ww.kkkkwwKpPPp..................',
+    '....wWwWwWwWwpPPPc.................',
+    '..............ss.............sss...'],
+  land: [
+    '................',
+    '................',
+    '.....pPggPp.....',
+    '...cpPPVVPPpc...',
+    '.ss..pPqqPp..ss.',
+    '....KkkwwkkK....',
+    '...kkkkwwkkkk...',
+    '..kkkkkwwkkkkk..',
+    '..WwWwWwWwWwWw..',
+    '...ww......ww...',
+    '..sss......sss..'],
+  dive: [
+    '.ss..pPggPp..ss.',
+    '..scpPPVVPPpcs..',
+    '.....pPqqPp.....',
+    '....KkkwwkkK....',
+    '...kkkkwwkkkk...',
+    '..kkkkkwwkkkkk..',
+    '..WwWwWwWwWwWw..',
+    '......Wwww......',
+    '......Wwww......',
+    '......Wwww......',
+    '......SSss......']
+};
+var HEAD_HIT_ROW = 7, HEAD_HIT_X0 = 2, HEAD_HIT_X1 = 15;     // 头部判定：刘海以下、两侧最外缘头发以内；耳朵、蝴蝶结、发顶不算
+function parseSpr(rows) {
+  var h = rows.length, w = rows[0].length, px = new Uint8Array(w * h);
+  for (var y = 0; y < h; y++) for (var x = 0; x < w; x++) {
+    var ch = rows[y].charAt(x);
+    px[y * w + x] = ch === '.' ? 0 : SCH[ch];
+  }
+  return { w: w, h: h, px: px, rows: rows };
+}
+var HEAD = parseSpr(SPR_SRC.head), HEAD_BLINK = parseSpr(SPR_SRC.blink);
+var POSE_NAMES = ['run0', 'run1', 'run2', 'run3', 'run4', 'run5', 'jump', 'apex', 'fall', 'tuck', 'dash', 'slide', 'land', 'dive'];
+var P_RUN = 0, P_JUMP = 6, P_APEX = 7, P_FALL = 8, P_TUCK = 9, P_DASH = 10, P_SLIDE = 11, P_LAND = 12, P_DIVE = 13;
+var NP = POSE_NAMES.length;
+// 合成缓冲（画面像素），原点 = 脚底中心
+var CBW = 72, CBH = 60, COX = 36, COY = 52, CBN = CBW * CBH;
+var cbFill = new Uint8Array(CBN), cb = new Uint8Array(CBN);
+var cbX0 = 0, cbX1 = 0, cbY0 = 0, cbY1 = 0;
+var poseSpr = [], poseBX = new Int32Array(NP), poseBY = new Int32Array(NP), poseHX = new Int32Array(NP), poseHY = new Int32Array(NP),
+    poseTX = new Int32Array(NP), poseTY = new Int32Array(NP),
+    hbX0 = new Int32Array(NP), hbX1 = new Int32Array(NP), hbY0 = new Int32Array(NP), hbY1 = new Int32Array(NP);
+(function () {
+  for (var p = 0; p < NP; p++) {
+    var sp = parseSpr(SPR_SRC[POSE_NAMES[p]]), x, y, nx = -1, ny = -1, tx = 99, ty = 0;
+    poseSpr.push(sp);
+    poseBX[p] = COX - (sp.w >> 1); poseBY[p] = COY - sp.h;
+    for (y = 0; y < sp.h && nx < 0; y++) { x = sp.rows[y].indexOf('g'); if (x >= 0) { nx = x; ny = y; } }
+    if (p === P_SLIDE) { poseHX[p] = poseBX[p] + 17; poseHY[p] = COY - HEAD.h; }        // 扑地滑行：头在最前、贴地
+    else { poseHX[p] = poseBX[p] + nx - 7; poseHY[p] = poseBY[p] + ny - 14; }         // 没有脖子：下巴正下方挂着 2x2 的铃铛
+    for (y = 0; y < sp.h; y++) { x = sp.rows[y].indexOf('k'); if (x >= 0 && x < tx) { tx = x; ty = y; } }
+    poseTX[p] = poseBX[p] + tx + 1; poseTY[p] = poseBY[p] + ty + 1;                       // 尾巴从裙子最靠后的地方长出
+    var x0 = 999, x1 = -999, y0 = 999, y1 = -999;
+    for (y = 0; y < sp.h; y++) for (x = 0; x < sp.w; x++) if (sp.px[y * sp.w + x]) {
+      if (poseBX[p] + x < x0) x0 = poseBX[p] + x; if (poseBX[p] + x > x1) x1 = poseBX[p] + x;
+      if (poseBY[p] + y < y0) y0 = poseBY[p] + y; if (poseBY[p] + y > y1) y1 = poseBY[p] + y;
+    }
+    for (y = HEAD_HIT_ROW; y < HEAD.h; y++) for (x = HEAD_HIT_X0; x < HEAD_HIT_X1; x++) if (HEAD.px[y * HEAD.w + x]) {
+      if (poseHX[p] + x < x0) x0 = poseHX[p] + x; if (poseHX[p] + x > x1) x1 = poseHX[p] + x;
+      if (poseHY[p] + y < y0) y0 = poseHY[p] + y; if (poseHY[p] + y > y1) y1 = poseHY[p] + y;
+    }
+    hbX0[p] = x0 - COX; hbX1[p] = x1 + 1 - COX; hbY0[p] = y0 - COY; hbY1[p] = y1 + 1 - COY;   // 相对脚底中心，画面像素
+  }
+})();
+
+/* 头发链与尾巴链：借鉴 Celeste 的做法，一串圆跟随上一节，带惯性、风和重力 */
+var HN = 7, hairX = new Float64Array(HN), hairY = new Float64Array(HN), HAIR_R = [3.7, 3.5, 3.3, 3.0, 2.6, 2.1, 1.6];
+var TN = 6, tailX = new Float64Array(TN), tailY = new Float64Array(TN), TAIL_R = [1.5, 1.7, 1.9, 1.9, 1.7, 1.4];
+function chainInit(xs, ys, n, ax, ay, dx, dy) { for (var i = 0; i < n; i++) { xs[i] = ax + dx * i; ys[i] = ay + dy * i; } }
+function chainStep(xs, ys, n, ax, ay, dx, dy0, ddy, seg, wob, ph) {
+  xs[0] = ax; ys[0] = ay;
+  for (var i = 1; i < n; i++) {
+    var tx = xs[i - 1] + dx, ty = ys[i - 1] + dy0 + ddy * i + wob * Math.sin(ph - i * 0.9);
+    xs[i] += (tx - xs[i]) * 0.5; ys[i] += (ty - ys[i]) * 0.5;
+    var ex = xs[i] - xs[i - 1], ey = ys[i] - ys[i - 1], L = Math.sqrt(ex * ex + ey * ey);
+    if (L > seg) { xs[i] = xs[i - 1] + ex / L * seg; ys[i] = ys[i - 1] + ey / L * seg; }
+  }
+}
+
+/* ================= 5x7 像素字体 ================= */
+var FONT_SRC = {
+  '0': '0e11131519110e', '1': '040c040404040e', '2': '0e11010204081f', '3': '1f02040201110e', '4': '02060a121f0202',
+  '5': '1f101e0101110e', '6': '0608101e11110e', '7': '1f010204080808', '8': '0e11110e11110e', '9': '0e11110f01020c',
+  'A': '0e1111111f1111', 'B': '1e11111e11111e', 'C': '0e11101010110e', 'D': '1c12111111121c', 'E': '1f10101e10101f',
+  'F': '1f10101e101010', 'G': '0e11101711110f', 'H': '1111111f111111', 'I': '0e04040404040e', 'J': '0702020202120c',
+  'K': '11121418141211', 'L': '1010101010101f', 'M': '111b1515111111', 'N': '11111915131111', 'O': '0e11111111110e',
+  'P': '1e11111e101010', 'Q': '0e11111115120d', 'R': '1e11111e141211', 'S': '0f10100e01011e', 'T': '1f040404040404',
+  'U': '1111111111110e', 'V': '11111111110a04', 'W': '1111111515150a', 'X': '11110a040a1111', 'Y': '1111110a040404',
+  'Z': '1f01020408101f', '!': '04040404040004', ':': '000c0c000c0c00', '-': '0000001f000000', '.': '00000000000c0c',
+  '/': '00010204081000', '+': '0004041f040400', '?': '0e110102040004', '>': '08040201020408', '<': '02040810080402',
+  '=': '00001f001f0000', 'x': '0000110a040a11'
+};
+var GLYPH = new Uint8Array(128 * 7), GHAS = new Uint8Array(128);
+(function () {
+  for (var k in FONT_SRC) {
+    var c = k.charCodeAt(0), s = FONT_SRC[k];
+    GHAS[c] = 1;
+    for (var r = 0; r < 7; r++) GLYPH[c * 7 + r] = parseInt(s.substr(r * 2, 2), 16);
+  }
+})();
+var NUMBUF = new Uint8Array(12);
+function fillBox(x, y, s, c) { for (var j = 0; j < s; j++) for (var i = 0; i < s; i++) pset(x + i, y + j, c); }
+function drawGlyph(code, x, y, col, sc) {
+  code &= 127;
+  if (!GHAS[code]) return;
+  for (var r = 0; r < 7; r++) {
+    var row = GLYPH[code * 7 + r];
+    for (var c = 0; c < 5; c++) if (row & (16 >> c)) fillBox(x + c * sc, y + r * sc, sc, col);
+  }
+}
+function shOff(sc) { return sc > 1 ? sc >> 1 : 1; }
+function textW(s, sc) { return s.length * 6 * sc - sc; }
+function drawText(s, x, y, col, sc, shadow) {
+  var so = shOff(sc);
+  for (var i = 0; i < s.length; i++) {
+    var code = s.charCodeAt(i);
+    if (shadow) drawGlyph(code, x + so, y + so, C_BLACK, sc);
+    drawGlyph(code, x, y, col, sc);
+    x += 6 * sc;
+  }
+}
+function drawTextC(s, y, col, sc, shadow) { drawText(s, ((FW - textW(s, sc)) / 2) | 0, y, col, sc, shadow); }
+function drawRainbow(s, x, y, sc, shift) {
+  var so = shOff(sc);
+  for (var i = 0; i < s.length; i++) {
+    var code = s.charCodeAt(i);
+    drawGlyph(code, x + so, y + so, C_BLACK, sc);
+    drawGlyph(code, x, y, HUE + ((i + shift) % 7), sc);
+    x += 6 * sc;
+  }
+}
+function drawRainbowC(s, y, sc, shift) { drawRainbow(s, ((FW - textW(s, sc)) / 2) | 0, y, sc, shift); }
+function numDigits(n) {
+  n = Math.floor(n); if (n < 0) n = 0;
+  var k = 0;
+  do { NUMBUF[k++] = n % 10; n = Math.floor(n / 10); } while (n > 0 && k < 12);
+  return k;
+}
+function numW(n, sc) { return numDigits(n) * 6 * sc - sc; }
+function drawNum(n, x, y, col, sc, shadow) {
+  var k = numDigits(n), so = shOff(sc);
+  for (var i = k - 1; i >= 0; i--) {
+    if (shadow) drawGlyph(48 + NUMBUF[i], x + so, y + so, C_BLACK, sc);
+    drawGlyph(48 + NUMBUF[i], x, y, col, sc);
+    x += 6 * sc;
+  }
+}
+function dimRect(x0, y0, x1, y1) {                           // 棋盘格抖动压暗
+  if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > FW) x1 = FW; if (y1 > FH) y1 = FH;
+  var p = PAL[C_BLACK];
+  for (var y = y0; y < y1; y++) for (var x = x0; x < x1; x++) if (((x + y) & 1) === 0) fb[y * FW + x] = p;
+}
+
+/* ================= 游戏状态（60Hz 固定步长） ================= */
+var mode = GS_TITLE, paused = 0, alive = 1, touchUI = 0;
+var tick = 0, lastTick = 0, dist = 0, dq = 0, spdBase = 2.4, spd = 2.4, dashBoost = 0, refY = FLOOR_BASE;
+var stage = 0, curBase = 2.4, curVF = 1, curTS = 1, patIdx = 0, nextPatTick = 70, boostOn = 0, boostT = 0;
+var h = 0, vh = 0, grounded = 1, fell = 0, landT = 99, freezeT = 0, djUsed = 0, djT = 99, coyote = 0;
+var sliding = 0, diving = 0, jumpCut = 0, launchT = 99;
+var dashT = -1, dashRet = -1, dashCD = 0, dashOff = 0;
+var jumpBuf = 0, jumpHeld = 0, downHeld = 0, dashBuf = 0, dashHeld = 0;   // 输入（键盘/触摸或自动演示写入）
+var pose = 0, legFrame = 0, legPhase = 0, eyeFwd = 0;
+var camXf = 2, camYf = 0;
+var soyaFX = CXC * R, soyaFY = FLOOR_BASE * R;               // Soya 脚底中心（画面像素，未减相机）
+var anchorX = CXC, anchorY = FLOOR_BASE, bx0 = 0, bx1 = 0, by0 = 0, by1 = 0;
+var ghostHue = 0, seq = 1, beamSideTop = 1;
+var shakeT = 0, shakeAmp = 0, warpReq = 0, nmReq = 0, nmSideReq = 0;
+var scoreF = 0, best = 0, newBest = 0, combo = 0, comboT = 0;
+var nearPopT = 0, nearPopX = 0, nearPopY = 0, nearPopN = 0, bannerT = 0, flashT = 0, deathT = 0, overT = 0;
+
+function shake(amp, t) { if (amp >= shakeAmp || shakeT <= 0) { shakeAmp = amp; shakeT = t; } }
+
+function buildStage(s) {
+  var i, p, prev = -1;
+  if (s === 0) { for (i = 0; i < 6; i++) seqArr[i] = i; seqLen = 6; return; }
+  seqLen = Math.min(6 + s, 10);
+  for (i = 0; i < seqLen - 1; i++) {
+    p = (hash(s * 977 + i * 131) * 9) | 0;
+    if (p >= 5) p++;                                          // 大陨石关卡只作为压轴
+    if (p === prev) { p = p === 9 ? 0 : p + 1; if (p === 5) p = 6; }
+    seqArr[i] = p; prev = p;
+  }
+  seqArr[seqLen - 1] = 5;
+}
+function setStage(s) {
+  stage = s; buildStage(s);
+  curBase = stageBase(s); curVF = stageVF(s); curTS = stageTS(s);
+  patIdx = 0; boostOn = 0; boostT = 0; spdBase = curBase;
+}
+function clearObstacles() { mAct.fill(0); bAct.fill(0); fAct.fill(0); }
+function nextStage() {
+  setStage(stage + 1); nextPatTick = tick + 60; clearObstacles();
+  scoreF += 500; bannerT = 150;
+}
+function resetChains() {
+  var hx = soyaFX + poseHX[pose] - COX + 3, hy = soyaFY + poseHY[pose] - COY + 8;
+  chainInit(hairX, hairY, HN, hx, hy, -2.6, 1.2);
+  chainInit(tailX, tailY, TN, soyaFX + poseTX[pose] - COX, soyaFY + poseTY[pose] - COY, -1.8, -0.6);
+}
+function resetWorld(dry) {
+  tick = 0; lastTick = 0; dist = 0; dq = 0; dashBoost = 0; alive = 1;
+  setStage(0); nextPatTick = 70;
+  h = 0; vh = 0; grounded = 1; fell = 0; landT = 99; freezeT = 0; djUsed = 0; djT = 99; coyote = 0;
+  sliding = 0; diving = 0; jumpCut = 0; launchT = 99;
+  dashT = -1; dashRet = -1; dashCD = 0; dashOff = 0;
+  jumpBuf = 0; jumpHeld = 0; downHeld = 0; dashBuf = 0; dashHeld = 0;
+  pose = 0; legFrame = 0; legPhase = 0; eyeFwd = 0;
+  camXf = 2; camYf = 0;
+  refY = baseSurf(CXC);
+  soyaFX = CXC * R; soyaFY = Math.round(refY * R);
+  clearObstacles();
+  for (var o = 0; o < 16; o++) patMin[o] = 99;
+  if (!dry) { clearParticles(); resetChains(); }
+}
+
+function allocM() { for (var i = 0; i < MM; i++) if (!mAct[i]) return i; return -1; }
+function allocB() { for (var i = 0; i < BM; i++) if (!bAct[i]) return i; return -1; }
+function allocF() { for (var i = 0; i < FM; i++) if (!fAct[i]) return i; return -1; }
+function spawnPattern(pi, ord) {
+  var it = PATTERNS[pi].it, ts = curTS, vf = curVF;
+  for (var j = 0; j < it.length; j++) {
+    var d = it[j], k;
+    if (d[0] === 'M') {
+      k = allocM(); if (k < 0) continue;
+      mTp[k] = tick + Math.round(d[1] * ts); mPrx[k] = d[2]; mPry[k] = d[3]; mVx[k] = d[4] * vf; mVy[k] = d[5] * vf; mR[k] = d[6];
+      var dtx = (W + 24 + d[6] - (CXC + d[2])) / mVx[k], dty = (-40 - d[6] - (FLOOR_BASE + d[3])) / mVy[k];
+      mSpawn[k] = Math.floor(mTp[k] + Math.max(dtx, dty)) - 1;
+      mAct[k] = 1; mPrev[k] = 99; mNear[k] = 0; mOrd[k] = ord; mShook[k] = 0;
+    } else if (d[0] === 'B') {
+      k = allocB(); if (k < 0) continue;
+      bWarn[k] = tick + Math.round(d[1] * ts); bFire[k] = bWarn[k] + Math.max(18, Math.round(d[2] * ts));
+      bDur[k] = d[3]; bY0[k] = d[4]; bSl[k] = d[5]; bTh[k] = d[6]; bAct[k] = 1; bNear[k] = 0; bOrd[k] = ord;
+    } else {
+      k = allocF(); if (k < 0) continue;
+      fRL[k] = d[2]; fRH[k] = d[3]; fGL[k] = d[4];
+      fX0[k] = Math.floor(dist) + CXC + Math.round(spdBase * Math.round(d[1] * ts)) - d[2];
+      fAct[k] = 1;
+    }
+  }
+}
+
+/* 自动演示的输入脚本 */
+function scriptInputs() {
+  jumpHeld = 0; downHeld = 0; dashHeld = 0;
+  for (var k = 0; k < NA; k++) {
+    var s = aStart[k];
+    if (s < 0 || tick < s) continue;
+    var t = tick - s, ty = aType[k], p = aParam[k];
+    if (ty === A_JUMP || ty === A_DJ) { if (t === 0) jumpBuf = 1; if (t < 40) jumpHeld = 1; }
+    else if (ty === A_JUMP2) { if (t === 0 || t === p) jumpBuf = 1; if (t < 40 + p) jumpHeld = 1; }
+    else if (ty === A_SLIDE) { if (t < p) downHeld = 1; }
+    else if (ty === A_DASH) { if (t === 0) dashBuf = 1; if (t < DASH_SURGE + p) dashHeld = 1; }
+  }
+}
+
+function control(dry) {
+  if (!alive) { jumpBuf = 0; dashBuf = 0; return; }
+  var u;
+  // 冲刺：前冲 6 帧（前 12 帧无敌），按住可停留在前方，松开后退回原位
+  if (dashBuf > 0) {
+    if (dashT < 0 && dashCD <= 0) {
+      dashT = 0; dashRet = -1; dashBuf = 0; sliding = 0; diving = 0;
+      if (!dry) fxDashStart();
+    } else dashBuf--;
+  }
+  if (dashT >= 0) {
+    if (dashT < DASH_SURGE) {
+      u = (dashT + 1) / DASH_SURGE; dashOff = 22 * (1 - (1 - u) * (1 - u)); dashBoost = 0.9;
+      if (!dry && (dashT & 1) === 0) fxGhost(0.55);
+    } else if (dashRet < 0 && (dashT < DASH_SURGE + 8 || (dashHeld && dashT < DASH_SURGE + DASH_MAXHOLD))) {
+      dashOff = 22; dashBoost = 0.9 * (1 - 0.6 * (dashT - DASH_SURGE) / DASH_MAXHOLD);
+      if (!dry && dashT === DASH_SURGE) fxGhost(0.55);
+    } else {
+      if (dashRet < 0) dashRet = dashT;
+      u = (dashT - dashRet) / DASH_RET;
+      dashBoost *= 0.9;
+      if (u >= 1) { dashOff = 0; dashT = -1; dashRet = -1; dashCD = DASH_CD; }
+      else dashOff = 22 * (1 - u * u * (3 - 2 * u));
+    }
+    if (dashT >= 0) dashT++;
+  } else {
+    if (dashCD > 0) dashCD--;
+    if (dashBoost > 0) { dashBoost *= 0.9; if (dashBoost < 0.005) dashBoost = 0; }
+  }
+  // 跳跃（含土狼时间、输入缓冲）/ 空中二段跳
+  if (grounded) coyote = 5; else if (coyote > 0) coyote--;
+  if (jumpBuf > 0) {
+    if (grounded || coyote > 0) {
+      vh = JV + (grounded && vh > 0 ? vh : 0); grounded = 0; coyote = 0; jumpBuf = 0; jumpCut = 0; launchT = 0; sliding = 0;
+      if (!dry) fxLaunch();
+    } else if (!djUsed && freezeT === 0) {
+      freezeT = DJ_FREEZE; djUsed = 1; jumpBuf = 0; jumpCut = 0; diving = 0;
+    } else jumpBuf--;
+  }
+  if (!grounded && !jumpHeld && !jumpCut && vh > 1.5 && freezeT === 0) { vh = 1.5; jumpCut = 1; }   // 松开键：矮跳
+  // 滑行 / 空中俯冲
+  if (downHeld) {
+    if (grounded) { if (!sliding) sliding = 1; }
+    else if (!diving && freezeT === 0 && !(dashT >= 0 && dashT < DASH_SURGE)) { diving = 1; if (vh > -3.8) vh = -3.8; }
+  } else if (sliding) sliding = 0;
+}
+
+function physics(dh, dry) {
+  var cwx = dh + CXC + Math.round(dashOff * R) / R, rh = rampH(cwx);
+  var gH = rh === GAP ? GAP : rh + refY - baseSurf(cwx);
+  if (freezeT > 0) {                                         // 二段跳：空中瞬间静止后重新加速
+    freezeT--; vh = 0;
+    if (freezeT === 0) { vh = DJV; djT = 0; if (!dry) fxDoubleJump(); }
+  } else if (grounded) {
+    if (gH === GAP) { grounded = 0; sliding = 0; } else { vh = gH - h; h = gH; }
+  } else if (alive && dashT >= 0 && dashT < DASH_SURGE) {
+    vh = 0;                                                  // 空中冲刺时短暂滞空
+  } else {
+    vh -= G; if (vh < -6) vh = -6; h += vh;
+    if (gH !== GAP && h <= gH && vh <= 0) {
+      if (h - vh >= gH - 1) {
+        h = gH; vh = 0; grounded = 1; landT = 0; djUsed = 0; djT = 99; diving = 0;
+        if (!dry && alive) fxLand();
+      } else fell = 1;                                       // 已在坑里，撞到断裂侧壁
+    }
+    if (h < -8) fell = 1;
+  }
+  if (landT < 99) landT++;
+  if (launchT < 99) launchT++;
+  if (djT < 99) djT++;
+}
+
+/* 姿势：由状态直接决定用哪一帧；判定框随帧变化 */
+function updatePose() {
+  var dashFwd = dashT >= 0 && dashRet < 0;
+  if (!grounded) {
+    if (freezeT > 0 || djT < 9) pose = P_TUCK;
+    else if (dashFwd) pose = P_DASH;
+    else if (diving) pose = P_DIVE;
+    else if (launchT < 3 || vh > 1.3) pose = P_JUMP;
+    else if (vh > -1.4) pose = P_APEX;
+    else pose = P_FALL;
+  } else if (sliding) pose = P_SLIDE;
+  else if (landT < 5) pose = P_LAND;
+  else if (dashFwd) pose = P_DASH;
+  else pose = P_RUN + legFrame;
+}
+
+/* 距离（精确包围盒，用于险些相撞与演示求解）与命中（向内宽容 1 个逻辑单位） */
+function sepCircle(cx, cy, r) {
+  var dx = cx < bx0 ? bx0 - cx : (cx > bx1 - 1 ? cx - (bx1 - 1) : 0);
+  var dy = cy < by0 ? by0 - cy : (cy > by1 - 1 ? cy - (by1 - 1) : 0);
+  return Math.sqrt(dx * dx + dy * dy) - r - 1;
+}
+function sideCircle(cx, cy, r) {
+  if (cy + r < by0) return 0;
+  if (cy - r > by1 - 1) return 1;
+  return cx < bx0 ? 2 : 3;
+}
+function hitCircle(cx, cy, r) {
+  var x0 = bx0 + 1, x1 = bx1 - 2, y0 = by0 + 1, y1 = by1 - 1;
+  var dx = cx < x0 ? x0 - cx : (cx > x1 ? cx - x1 : 0);
+  var dy = cy < y0 ? y0 - cy : (cy > y1 ? cy - y1 : 0);
+  return dx * dx + dy * dy <= (r - 0.5) * (r - 0.5);
+}
+function beamTh(b, t) {
+  var ft = t - bFire[b];
+  if (ft < 0) return 0;
+  if (ft < bDur[b]) return bTh[b];
+  ft -= bDur[b];
+  return ft < 4 ? bTh[b] - 1 - ft : 0;
+}
+function beamYF(b, x) { return refY + bY0[b] + bSl[b] * (x - CXC); }
+function beamY(b, x) { return Math.round(beamYF(b, x)); }
+function beamSep(b, th) {
+  var best2 = 99, x, t0, t1, s;
+  for (x = bx0; x < bx1; x++) {
+    t0 = beamY(b, x) - (th >> 1); t1 = t0 + th;
+    if (t1 <= by0) s = by0 - t1; else if (t0 >= by1) s = t0 - by1; else s = -1;
+    if (s < best2) { best2 = s; beamSideTop = t0 < by0 ? 1 : 0; }
+  }
+  return best2;
+}
+function beamHit(b, th) {
+  var cut = th >= 3 ? 1 : 0;                                 // 外缘的青色光晕不致命
+  for (var x = bx0 + 1; x < bx1 - 1; x++) {
+    var t0 = beamY(b, x) - (th >> 1) + cut, t1 = t0 + th - 2 * cut;
+    if (t1 > by0 + 1 && t0 < by1) return 1;
+  }
+  return 0;
+}
+function invuln() { return mode !== GS_PLAY || boostOn || warpT >= 0 || (dashT >= 0 && dashT < DASH_IFRAMES); }
+function nearMiss(side) {
+  nmReq = 1; nmSideReq = side;
+  nearPopT = 40; nearPopX = (bx0 + bx1) / 2; nearPopY = by0 - 8; nearPopN = 0;
+  if (mode === GS_PLAY) { combo = combo < 9 ? combo + 1 : 9; comboT = 300; scoreF += 50 * combo; nearPopN = combo; }
+}
+function killPlayer() {
+  if (!alive) return;
+  alive = 0; mode = GS_DYING; deathT = 0; hitstop = 8; slowmo = 0; flashT = 2; shake(2, 24);
+  sliding = 0; nmReq = 0;
+  fxDeath();
+  saveBest();
+}
+function saveBest() {
+  var s = Math.floor(scoreF);
+  if (s > best) {
+    best = s; newBest = 1;
+    try { window.localStorage.setItem('soyaRainbowDashBest', '' + best); } catch (e) { /* 存储不可用时只保留本次 */ }
+  }
+}
+
+function updateObstacles(dry) {
+  var m, b, warn = 0;
+  for (m = 0; m < MM; m++) {
+    if (mAct[m] === 1) { if (tick >= mSpawn[m]) mAct[m] = 2; else continue; }
+    if (mAct[m] !== 2) continue;
+    var dt = tick - mTp[m], r = mR[m];
+    var x = CXC + mPrx[m] + mVx[m] * dt, y = refY + mPry[m] + mVy[m] * dt;
+    mX[m] = x; mY[m] = y;
+    var ix = Math.round(x), iy = Math.round(y);
+    var s = sepCircle(ix, iy, r), o = mOrd[m];
+    if (o >= 0 && o < 16 && s < patMin[o]) patMin[o] = s;
+    if (ix - r > bx1) warn = 1;
+    if (!dry) {
+      if (alive && !invuln() && hitCircle(ix, iy, r)) killPlayer();
+      else if (alive && !mNear[m] && mPrev[m] <= 2 && s > mPrev[m]) { mNear[m] = 1; nearMiss(sideCircle(ix, iy, r)); }
+      fxTrail(m, x, y);
+      if (r >= 9 && !mShook[m] && ix - r < bx1 + 2) { mShook[m] = 1; shake(2, 16); }
+    }
+    mPrev[m] = s;
+    if (iy + r >= refY - 1) { mAct[m] = 0; if (!dry) fxShatter(m, x, y); }   // 不撞地板：触地前碎裂
+    else if (x < -40 || y > 150) mAct[m] = 0;
+  }
+  for (b = 0; b < BM; b++) {
+    if (!bAct[b]) continue;
+    if (tick >= bFire[b] + bDur[b] + 4) { bAct[b] = 0; continue; }
+    if (tick >= bWarn[b]) warn = 1;
+    var th = beamTh(b, tick);
+    if (th <= 0) continue;
+    var s2 = beamSep(b, th), o2 = bOrd[b];
+    if (o2 >= 0 && o2 < 16 && s2 < patMin[o2]) patMin[o2] = s2;
+    if (!dry) {
+      if (alive && !invuln() && beamHit(b, th)) killPlayer();
+      else if (alive && !bNear[b] && s2 <= 2 && tick < bFire[b] + bDur[b]) { bNear[b] = 1; nearMiss(beamSideTop ? 0 : 1); }
+      if (tick === bFire[b]) { shake(1, 10); fxBeamStart(b); }
+      if (bSl[b] !== 0 && tick < bFire[b] + bDur[b]) fxBeamImpact(b);
+    }
+  }
+  eyeFwd = warn;
+}
+
+function simSoya() {                                         // 头发与尾巴（只影响画面）
+  var ph = tick * 0.21, air = grounded ? 0 : 1;
+  var hax = soyaFX + poseHX[pose] - COX + 3, hay = soyaFY + poseHY[pose] - COY + 8;
+  var wind = 0.7 + spd * 0.22 + (dashT >= 0 && dashRet < 0 ? 1.2 : 0);
+  chainStep(hairX, hairY, HN, hax, hay, -wind, pose === P_SLIDE ? 0.3 : 1.7 - air * 0.5, 0.05, 3.0, 0.55, ph);
+  var tax = soyaFX + poseTX[pose] - COX, tay = soyaFY + poseTY[pose] - COY;
+  chainStep(tailX, tailY, TN, tax, tay, -(1.1 + spd * 0.16), 0.9, -0.62, 2.3, 0.45, ph * 1.3 + 1);
+}
+
+function step(dry) {
+  if (dry || mode === GS_TITLE) scriptInputs();
+  if (alive && !boostOn) {                                   // 按顺序播放本关的攻击模式
+    if (patIdx < seqLen) {
+      if (tick >= nextPatTick) {
+        var pi = seqArr[patIdx];
+        spawnPattern(pi, patIdx);
+        nextPatTick = tick + Math.round(PATTERNS[pi].len * curTS);
+        patIdx++;
+      }
+    } else if (tick >= nextPatTick) { boostOn = 1; boostT = 0; }
+  }
+  if (boostOn) {                                             // BOOST：全力加速（无敌）
+    var bu = boostT / 60; if (bu > 1) bu = 1;
+    spdBase = curBase + 3.8 * bu * bu;
+    boostT++;
+    if (boostT === BOOST_LEN && !dry) warpReq = 1;
+  }
+  if (!alive) spdBase *= 0.95;
+  control(dry);
+  spd = spdBase * (1 + dashBoost);
+  dist += spd;
+  dq = Math.floor(dist * R) / R;                              // 滚动量对齐到画面像素
+  refY = baseSurf(dq + CXC);
+  physics(dq, dry);
+  if (grounded && !sliding) legPhase += spd * 0.165;
+  legFrame = Math.floor(legPhase) % 6;
+  updatePose();
+  soyaFX = Math.round((CXC + dashOff) * R);
+  soyaFY = Math.round((refY - h) * R);
+  anchorX = soyaFX / R; anchorY = soyaFY / R;
+  bx0 = Math.floor((soyaFX + hbX0[pose]) / R); bx1 = Math.ceil((soyaFX + hbX1[pose]) / R);
+  by0 = Math.floor((soyaFY + hbY0[pose]) / R); by1 = Math.ceil((soyaFY + hbY1[pose]) / R);
+  if (!dry && alive && sliding && grounded) fxSlide();
+  if (!dry && alive && fell && h < -12 && mode === GS_PLAY) killPlayer();   // 掉进断裂
+  updateObstacles(dry);
+  for (var f = 0; f < FM; f++) if (fAct[f] && fX0[f] + fRL[f] + fGL[f] < dist - 60) fAct[f] = 0;
+  // 相机：阻尼追随 + 速度预读 + BOOST 时降低
+  var tcy = (alive ? -h * 0.55 : camYf) + (boostOn ? 7 : 0);
+  camYf += (tcy - camYf) * 0.085;
+  var tcx = 2 + (spdBase - 2.4) * 3 + dashOff * 0.15;
+  camXf += (tcx - camXf) * 0.1;
+  if (!dry) {
+    if (alive) simSoya();
+    updateParticles(); updateBackground(); emitAmbient();
+    if (mode === GS_PLAY && alive) {
+      scoreF += spd * 0.1;
+      if (comboT > 0 && --comboT === 0) combo = 0;
+    }
+  }
+  lastTick = tick;
+  tick++;
+}
+
+/* ================= Soya 合成：头发链 → 尾巴 → 身体 → 头，再自动描边 ================= */
+function chainBlit(xs, ys, n, radii, kind) {
+  for (var i = n - 1; i >= 0; i--) {
+    var cx = xs[i] - soyaFX + COX, cy = ys[i] - soyaFY + COY, r = radii[i], rr = r * r;
+    var xa = Math.floor(cx - r), xb = Math.ceil(cx + r), ya = Math.floor(cy - r), yb = Math.ceil(cy + r);
+    for (var y = ya; y <= yb; y++) {
+      if (y < 0 || y >= CBH) continue;
+      for (var x = xa; x <= xb; x++) {
+        if (x < 0 || x >= CBW) continue;
+        var ex = x + 0.5 - cx, ey = y + 0.5 - cy;
+        if (ex * ex + ey * ey > rr) continue;
+        var c;
+        if (kind === 0) c = ey > r * 0.3 ? 34 : ((ex < -r * 0.2 && ey < -r * 0.35 && (i & 1) === 0) ? 32 : 33);
+        else c = i >= n - 2 ? 36 : (ey > r * 0.25 ? 34 : 33);
+        cbFill[y * CBW + x] = c;
+      }
+    }
+  }
+}
+function sprBlit(sp, ox, oy) {
+  for (var y = 0; y < sp.h; y++) {
+    var Y = oy + y;
+    if (Y < 0 || Y >= CBH) continue;
+    for (var x = 0; x < sp.w; x++) {
+      var c = sp.px[y * sp.w + x], X = ox + x;
+      if (c && X >= 0 && X < CBW) cbFill[Y * CBW + X] = c;
+    }
+  }
+}
+function composeSoya(eyes) {                                 // eyes：0 睁眼，1 眨眼（弯弯的笑眼）
+  var i, x, y;
+  cbFill.fill(0);
+  chainBlit(hairX, hairY, HN, HAIR_R, 0);
+  chainBlit(tailX, tailY, TN, TAIL_R, 1);
+  sprBlit(poseSpr[pose], poseBX[pose], poseBY[pose]);
+  sprBlit(eyes === 1 ? HEAD_BLINK : HEAD, poseHX[pose], poseHY[pose]);
+  cbX0 = CBW; cbX1 = 0; cbY0 = CBH; cbY1 = 0;
+  for (y = 0; y < CBH; y++) for (x = 0; x < CBW; x++) {
+    i = y * CBW + x;
+    var c = cbFill[i];
+    if (!c) {
+      var bestO = 0, bestL = 999, n;
+      if (x > 0 && (n = cbFill[i - 1]) && LUM[OUTL[n]] < bestL) { bestO = OUTL[n]; bestL = LUM[bestO]; }
+      if (x < CBW - 1 && (n = cbFill[i + 1]) && LUM[OUTL[n]] < bestL) { bestO = OUTL[n]; bestL = LUM[bestO]; }
+      if (y > 0 && (n = cbFill[i - CBW]) && LUM[OUTL[n]] < bestL) { bestO = OUTL[n]; bestL = LUM[bestO]; }
+      if (y < CBH - 1 && (n = cbFill[i + CBW]) && LUM[OUTL[n]] < bestL) { bestO = OUTL[n]; bestL = LUM[bestO]; }
+      c = bestO;
+    }
+    cb[i] = c;
+    if (c) { if (x < cbX0) cbX0 = x; if (x >= cbX1) cbX1 = x + 1; if (y < cbY0) cbY0 = y; if (y >= cbY1) cbY1 = y + 1; }
+  }
+}
+var GH_N = 16, ghostBuf = new Uint8Array(GH_N * CBN), ghostSlot = 0;
+
+/* ================= 特效（全部走同一粒子系统；坐标为逻辑单位） ================= */
+function fxLand() {                                            // 着地：虹色火花
+  var fx = anchorX, fy = anchorY - 0.5;
+  for (var i = 0; i < 18; i++) {
+    var q = seq++, dir = i & 1 ? 1 : -1;
+    emit(K_RAIN, fx + dir * (1 + (i >> 1) * 0.8), fy, dir * (0.3 + hash(q) * 1.6), -(0.5 + hash(q + 99) * 1.6),
+         14 + ((hash(q + 7) * 12) | 0), i % 7, 0.13, 0.7, 1 + (i % 3 === 0 ? 1 : 0), 0);
+  }
+}
+function fxLaunch() {
+  var fx = anchorX, fy = anchorY - 0.5;
+  for (var i = 0; i < 10; i++) {
+    var q = seq++;
+    emit(K_RAIN, fx + hash(q + 3) * 10 - 5, fy, (hash(q) - 0.5) * 1.2 - 0.6, -(0.2 + hash(q + 1) * 0.7),
+         10 + ((hash(q + 2) * 8) | 0), i % 7, 0.08, 0.8, 1 + (i & 1), 0);
+  }
+}
+function fxDoubleJump() {                                      // 二段跳：虹色环扩散
+  var cx = anchorX, cy = anchorY - 5;
+  emit(K_RING, cx, cy, 0, 0, 12, 0, 0, 0, 1, 4);
+  for (var i = 0; i < 14; i++) {
+    var q = seq++, a = i / 14 * 6.2832;
+    emit(K_RAIN, cx, cy, Math.cos(a) * 1.8, Math.sin(a) * 1.8 + 0.4, 12 + ((hash(q) * 6) | 0), i % 7, 0.05, 0.3, 1 + (i & 1), 0);
+  }
+}
+function fxSlide() {                                           // 滑行：接地面飞溅火花
+  for (var i = 0; i < 3; i++) {
+    var q = seq++;
+    emit(K_SPARK, anchorX + 4 + hash(q + 5) * 5, by1 - 0.5, -(0.6 + hash(q) * 1.8), -(0.2 + hash(q + 1) * 1.3),
+         9 + ((hash(q + 2) * 9) | 0), 0, 0.1, 0.6, 1 + (i === 0 ? 1 : 0), 0);
+  }
+}
+function fxGhost(lock) {                                       // 残影：依次使用彩虹 7 色，拍下当前剪影
+  ghostHue = ghostHue === 6 ? 0 : ghostHue + 1;
+  composeSoya(0);
+  var o = ghostSlot * CBN;
+  for (var i = 0; i < CBN; i++) ghostBuf[o + i] = cb[i] ? 1 : 0;
+  emit(K_GHOST, anchorX, anchorY, 0, 0, 14, ghostHue, 0, lock, 1, ghostSlot);
+  ghostSlot = ghostSlot === GH_N - 1 ? 0 : ghostSlot + 1;
+}
+function fxDashStart() {
+  shake(1, 6);
+  for (var i = 0; i < 16; i++) {
+    var q = seq++;
+    emit(K_SPARK, anchorX - 3, anchorY - 1 - hash(q + 4) * 11, -(1 + hash(q) * 2.5), (hash(q + 1) - 0.6) * 1.2,
+         10 + ((hash(q + 2) * 8) | 0), 0, 0.06, 0.5, 1 + (i & 1), 0);
+  }
+}
+function fxTrail(m, x, y) {                                    // 陨石尾巴：熔岩色 → 暗色
+  var vx = mVx[m], vy = mVy[m], L = Math.sqrt(vx * vx + vy * vy), ux = vx / L, uy = vy / L, r = mR[m];
+  var n = r >= 9 ? 6 : (r >= 5 ? 4 : 3);
+  for (var i = 0; i < n; i++) {
+    var q = seq++, j = (hash(q) - 0.5) * 2 * r * 0.75;
+    emit(K_TRAIL, x - ux * r * 0.6 - uy * j, y - uy * r * 0.6 + ux * j,
+         vx * 0.12 + (hash(q + 5) - 0.5) * 0.35, vy * 0.12 + (hash(q + 9) - 0.5) * 0.35,
+         7 + r + ((hash(q + 3) * 8) | 0), 0, 0, 0, (r >= 5 && i < 2) ? 3 : (i & 1) + 1, 0);
+  }
+}
+function fxShatter(m, x, y) {                                  // 触地前碎裂
+  var r = mR[m], n = 12 + r * 4;
+  for (var i = 0; i < n; i++) {
+    var q = seq++, a = i / n * 6.2832 + hash(q) * 0.6, sp = 0.5 + hash(q + 1) * (1.1 + r * 0.14);
+    emit(K_DEBRIS, x + Math.cos(a) * r * 0.5, y + Math.sin(a) * r * 0.5,
+         Math.cos(a) * sp + mVx[m] * 0.3, Math.sin(a) * sp * 0.8 - 0.9, 18 + ((hash(q + 2) * 22) | 0), 0, 0.07, 0.5,
+         (r >= 5 && hash(q + 3) < 0.35) ? 3 : 1 + (i & 1), 0);
+    if ((i & 1) === 0) emit(K_TRAIL, x, y, Math.cos(a) * sp * 1.4, Math.sin(a) * sp - 0.6, 8 + ((hash(q + 4) * 8) | 0), 0, 0.05, 0.4, 1, 0);
+  }
+  if (r >= 9) shake(2, 12);
+}
+function fxBeamStart(b) {
+  var ex = W + camXf - 1, ey = beamYF(b, ex);
+  for (var i = 0; i < 16; i++) {
+    var q = seq++;
+    emit(K_BSPARK, ex, ey, -(0.5 + hash(q) * 2.5), (hash(q + 1) - 0.5) * 2.4, 8 + ((hash(q + 2) * 8) | 0), 0, 0, 0, 1 + (i & 1), 0);
+  }
+}
+function fxBeamImpact(b) {                                     // 斜向光束打到地板的火花
+  var ix = CXC - bY0[b] / bSl[b];
+  for (var i = 0; i < 4; i++) {
+    var q = seq++;
+    emit(K_BSPARK, ix + (hash(q + 3) - 0.5) * 3, refY - 0.5, (hash(q) - 0.7) * 2.2, -(0.4 + hash(q + 1) * 1.6),
+         8 + ((hash(q + 2) * 8) | 0), 0, 0.1, 1, 1, 0);
+  }
+}
+function fxNearMiss(side) {                                    // 擦身而过的闪光
+  var cx = side === 2 ? bx0 - 1 : (side === 3 ? bx1 : (bx0 + bx1) / 2);
+  var cy = side === 0 ? by0 - 1 : (side === 1 ? by1 : (by0 + by1) / 2);
+  for (var i = 0; i < 12; i++) {
+    var a = i / 12 * 6.2832;
+    emit(K_SPARK, cx, cy, Math.cos(a) * 1.3, Math.sin(a) * 1.3, 10, 0, 0, 0, 1, 0);
+  }
+}
+function fxDeath() {                                           // 被击中：Soya 碎成像素 + 虹色爆散
+  composeSoya(1);
+  var cx = anchorX, cy = anchorY - 7, x0 = soyaFX - COX, y0 = soyaFY - COY;
+  for (var y = cbY0; y < cbY1; y++) for (var x = cbX0; x < cbX1; x++) {
+    var c = cb[y * CBW + x];
+    if (!c) continue;
+    var wx = (x0 + x + 0.5) / R, wy = (y0 + y + 0.5) / R;
+    var q = seq++, a = Math.atan2(wy - cy, wx - cx) + (hash(q) - 0.5) * 0.8, sp = 0.5 + hash(q + 1) * 2.2;
+    emit(K_BODY, wx, wy, Math.cos(a) * sp, Math.sin(a) * sp - 1.2, 30 + ((hash(q + 2) * 30) | 0), 0, 0.09, 0.3, 1, c);
+  }
+  for (var i = 0; i < 36; i++) {
+    var q2 = seq++, a2 = i / 36 * 6.2832, sp2 = 1.2 + hash(q2) * 2.4;
+    emit(K_RAIN, cx, cy, Math.cos(a2) * sp2, Math.sin(a2) * sp2 - 0.6, 20 + ((hash(q2 + 1) * 20) | 0), i % 7, 0.05, 0.2, 1 + (i & 1), 0);
+  }
+  emit(K_RING, cx, cy, 0, 0, 16, 0, 0, 0, 1, 3);
+}
+
+/* ================= 背景层滚动与环境粒子 ================= */
+function updateBackground() {
+  var i, q;
+  for (i = 0; i < FS_N; i++) { fsX[i] -= spd * 0.03 * R; if (fsX[i] < 0) fsX[i] += FW; }
+  for (i = 0; i < MS_N; i++) {
+    msX[i] -= spd * 0.35 * R;
+    if (msX[i] < -16) { q = seq++; msX[i] += FW + 32; msY[i] = 4 + ((hash(q) * 168) | 0); }
+  }
+  for (i = 0; i < SL_N; i++) {
+    slX[i] -= spd * 3.4 * R;
+    if (slX[i] + slL[i] * spd * R < 0) { q = seq++; slX[i] = FW + hash(q) * 160; slY[i] = 4 + ((hash(q + 1) * 168) | 0); slL[i] = 4 + hash(q + 2) * 6; }
+  }
+  plX -= spd * 0.012 * R; if (plX < -PL_W) plX = FW + 80;
+  nbX -= spd * 0.005 * R; if (nbX < -NEB_W) nbX = FW + 60;
+}
+function emitAmbient() {
+  var n = spd > 4 ? 6 : 3, i;
+  for (i = 0; i < n; i++) {                                    // 从地板下缘洒落的虹色光粒
+    var q = seq++, stX = hash(q * 3 + 1) * (W + 40) + camXf - 10, wx = dq + stX, rh = rampH(wx);
+    if (rh === GAP) continue;
+    emit(K_MOTE, stX, baseSurf(wx) - rh + FLOOR_T, (hash(q * 3 + 2) - 0.5) * 0.2, 0.15 + hash(q * 3 + 3) * 0.4,
+         26 + ((hash(q * 7) * 34) | 0), (hash(q * 11) * 7) | 0, 0.004, 1, (hash(q * 13) < 0.3) ? 2 : 1, 0);
+  }
+  for (var f = 0; f < FM; f++) {                               // 断裂边缘碎光
+    if (!fAct[f]) continue;
+    for (i = 0; i < 3; i++) {
+      var side = i & 1, ex = side ? fX0[f] + fRL[f] + fGL[f] - dq : fX0[f] + fRL[f] - dq - 0.5, q2 = seq++;
+      if (ex < camXf - 4 || ex > W + camXf + 4) continue;
+      emit(K_MOTE, ex, baseSurf(dq + ex) - (side ? 0 : fRH[f]) + hash(q2) * FLOOR_T, (hash(q2 + 1) - 0.5) * 0.3,
+           0.3 + hash(q2 + 2) * 0.5, 30, (hash(q2 + 3) * 7) | 0, 0.01, 1, 1, 0);
+    }
+  }
+  if (boostOn && tick % 5 === 0) fxGhost(0.75);                 // BOOST 中持续的虹色残影
+}
+
+/* ================= 标题演示：为每个动作找“最晚仍能躲开”的时机 ================= */
+var solveReport = [];
+function actionScore(k) {
+  if (fell) return -99;
+  var w = 99;
+  for (var o = 0; o <= aOrd[k]; o++) if (patMin[o] < w) w = patMin[o];
+  return w;
+}
+function runUntil(end) { while (tick < end) { step(true); if (fell) break; } }
+function solve() {
+  var k, c;
+  solveReport.length = 0;
+  for (k = 0; k < NA; k++) aStart[k] = -1;
+  for (k = 0; k < NA; k++) {
+    var found = -1, bestC = aWinE[k], bestS = -999;
+    for (c = aWinE[k]; c >= aWinS[k]; c--) {
+      aStart[k] = c;
+      resetWorld(true); runUntil(aEval[k]);
+      var s = actionScore(k);
+      if (s >= 1) { found = c; break; }
+      if (s > bestS) { bestS = s; bestC = c; }
+    }
+    aStart[k] = found >= 0 ? found : bestC;
+    solveReport.push({ k: k, start: aStart[k], ok: found >= 0, sep: found >= 0 ? actionScore(k) : bestS });
+  }
+  resetWorld(false);
+}
+
+/* ================= 实时控制：击中停止 / 慢动作 / WARP / 死亡 ================= */
+var hitstop = 0, slowmo = 0, glowT = 0, glowSide = 0, warpT = -1, realFrame = 0;
+function tickReal() {
+  realFrame++;
+  if (paused) return;
+  if (shakeT > 0) shakeT--;
+  if (glowT > 0) glowT--;
+  if (nearPopT > 0) nearPopT--;
+  if (bannerT > 0) bannerT--;
+  if (flashT > 0) flashT--;
+  if (mode === GS_DYING) { if (++deathT > 70) { mode = GS_OVER; overT = 0; } }
+  else if (mode === GS_OVER) overT++;
+  if (warpT >= 0) {
+    warpT++;
+    if (warpT === WARP_RESET) {                                // 闪白最亮时切换：演示回到开头 / 游戏进入下一关
+      if (mode === GS_TITLE) resetWorld(false); else nextStage();
+      shakeT = 0;
+      emit(K_RING, anchorX, anchorY - 7, 0, 0, 30, 0, 0, 0, 1, 6);
+    }
+    if (warpT > WARP_LEN) warpT = -1;
+  }
+  if (hitstop > 0) { hitstop--; return; }
+  if (slowmo > 0 && ((--slowmo) & 1)) return;                  // 慢动作：抽掉一半更新步
+  step(false);
+  if (warpReq) { warpReq = 0; if (alive) warpT = 0; }
+  if (nmReq) {
+    nmReq = 0;
+    hitstop = mode === GS_TITLE ? 4 : 3; slowmo = mode === GS_TITLE ? 18 : 12;
+    glowT = 26; glowSide = nmSideReq; fxNearMiss(glowSide);
+  }
+}
+function startGame() {
+  resetWorld(false);
+  mode = GS_PLAY; paused = 0; alive = 1;
+  scoreF = 0; combo = 0; comboT = 0; newBest = 0;
+  hitstop = 0; slowmo = 0; warpT = -1; glowT = 0; flashT = 4; bannerT = 110; nearPopT = 0; deathT = 0; overT = 0;
+}
+function toTitle() {
+  resetWorld(false);
+  mode = GS_TITLE; paused = 0; alive = 1; hitstop = 0; slowmo = 0; warpT = -1; flashT = 4; bannerT = 0; nearPopT = 0;
+}
+
+/* ================= 绘制（全部写入 320x180 帧缓冲，整数像素坐标） ================= */
+var BEAM_ROWS = [null];                                        // 光束粗细 th（逻辑单位）→ 2*th 行颜色
+(function () {
+  for (var th = 1; th <= 6; th++) {
+    var rows = [], n = th * R;
+    for (var j = 0; j < n; j++) {
+      var d = Math.abs(j - (n - 1) / 2) / th;
+      rows.push(d > 0.8 ? C_CYAN : (d > 0.45 ? C_BCYAN : C_WHITE));
+    }
+    BEAM_ROWS.push(rows);
+  }
+})();
+function drawSpr(spr, sw, shh, x0, y0) {
+  for (var y = 0; y < shh; y++) for (var x = 0; x < sw; x++) {
+    var c = spr[y * sw + x];
+    if (c !== 255) pset(x0 + x, y0 + y, c);
+  }
+}
+function drawSky(shX, shY) {
+  var i, x, y, c, py = shY - Math.round(camYf * 0.06 * R);
+  drawSpr(nebSpr, NEB_W, NEB_H, Math.round(nbX) + shX, 12 + py);
+  drawSpr(plSpr, PL_W, PL_H, Math.round(plX) + shX, 8 + py);
+  for (i = 0; i < FS_N; i++) {
+    x = (Math.round(fsX[i]) + shX) % FW; if (x < 0) x += FW;
+    y = fsY[i] + shY; c = fsC[i];
+    var tw = (realFrame + fsP[i]) % 96;
+    if (tw < 6) {
+      c = C_WHITE;
+      if (i % 9 === 0 && tw > 1 && tw < 5) {                   // 大星闪烁：十字光芒
+        pset(x - 1, y, C_STAR); pset(x + 1, y, C_STAR); pset(x, y - 1, C_STAR); pset(x, y + 1, C_STAR);
+        if (tw === 3) { pset(x - 2, y, 5); pset(x + 2, y, 5); pset(x, y - 2, 5); pset(x, y + 2, 5); }
+      }
+    } else if (tw < 10 && c === C_STAR) c = 5;
+    pset(x, y, c);
+  }
+  var len = Math.round(spd * 0.95 * R); if (len < 4) len = 4; if (len > 12) len = 12;
+  var my = shY - Math.round(camYf * 0.2 * R);
+  for (i = 0; i < MS_N; i++) {
+    x = Math.round(msX[i]) + shX; y = msY[i] + my;
+    pset(x, y, C_WHITE);
+    hline(x + 1, x + len, y, C_STAR);
+  }
+  var nAct = Math.round((spd - 1.8) * 5); if (nAct < 2) nAct = 2; if (nAct > SL_N) nAct = SL_N;
+  for (i = 0; i < nAct; i++) {
+    x = Math.round(slX[i]) + shX; y = slY[i] + shY;
+    hline(x, x + Math.round(slL[i] * spd * 0.55 * R), y, (i & 1) ? C_BCYAN : C_WHITE);
+  }
+}
+function drawFloor(ox, oy) {
+  var dF = Math.round(dq * R), divW = spd > 4.2 ? 3 : 2;
+  for (var sx = 0; sx < FW; sx++) {
+    var fx = dF + sx - ox, wx = fx / R, rh = rampH(wx);
+    if (rh === GAP) continue;
+    var y = Math.round((baseSurf(wx) - rh) * R) + oy;
+    var dark = ((((fx % 24) + 24) % 24) < divW) || rampH(wx - 0.5) === GAP || rampH(wx + 0.5) === GAP;
+    for (var s = 0; s < 7; s++) {
+      var c = dark ? HUED + s : HUE + s;
+      for (var t = 0; t < STRIPE[s]; t++) { pset(sx, y, c); y++; }
+    }
+  }
+}
+function drawRing(cx, cy, r, dark) {
+  var x = r, y = 0, err = 1 - r, b = dark ? HUED : HUE;
+  while (x >= y) {
+    pset(cx + x, cy + y, b); pset(cx + y, cy + x, b + 1); pset(cx - y, cy + x, b + 2); pset(cx - x, cy + y, b + 3);
+    pset(cx - x, cy - y, b + 4); pset(cx - y, cy - x, b + 5); pset(cx + y, cy - x, b + 6); pset(cx + x, cy - y, b);
+    y++;
+    if (err < 0) err += 2 * y + 1; else { x--; err += 2 * (y - x) + 1; }
+  }
+}
+function drawGhost(slot, x0, y0, c) {
+  var o = slot * CBN, p = PAL[c];
+  for (var y = 0; y < CBH; y++) {
+    var Y = y0 + y;
+    if (Y < 0 || Y >= FH) continue;
+    for (var x = 0; x < CBW; x++) {
+      if (!ghostBuf[o + y * CBW + x]) continue;
+      var X = x0 + x;
+      if (X >= 0 && X < FW) fb[Y * FW + X] = p;
+    }
+  }
+}
+function drawParticles(ox, oy) {
+  for (var i = 0; i < PN; i++) {
+    var L = pLife[i];
+    if (L <= 0) continue;
+    var k = pKind[i], ramp = RAMPS[k * 7 + pHue[i]], n = ramp.length;
+    var ci = (((pMax[i] - L) * n) / pMax[i]) | 0; if (ci >= n) ci = n - 1;
+    var c = ramp[ci], x = Math.round(pX[i] * R) + ox, y = Math.round(pY[i] * R) + oy;
+    if (k === K_GHOST) { drawGhost(pAux[i], x - COX, y - COY, c); continue; }
+    if (k === K_RING) { drawRing(x, y, pAux[i] * R, L * 2 < pMax[i] ? 1 : 0); continue; }
+    if (k === K_BODY) {
+      var fr = (pMax[i] - L) / pMax[i];
+      c = fr < 0.5 ? pAux[i] : (fr < 0.8 ? DARK[pAux[i]] : DARK[DARK[pAux[i]]]);
+    }
+    var sz = pSz[i];
+    if (sz === 1) pset(x, y, c);
+    else for (var yy = 0; yy < sz; yy++) for (var xx = 0; xx < sz; xx++) pset(x + xx, y + yy, c);
+  }
+}
+function drawBeams(ox, oy) {
+  var t = lastTick;
+  for (var b = 0; b < BM; b++) {
+    if (!bAct[b] || t < bWarn[b]) continue;
+    var ft = t - bFire[b], sx, wx, y, j;
+    if (ft < 0) {                                              // 预告：1px 洋红闪烁线
+      var on = ft > -10 ? (realFrame & 1) : ((realFrame >> 2) & 1);
+      if (!on) continue;
+      for (sx = 0; sx < FW; sx++) {
+        wx = (sx - ox) / R; y = Math.round(beamYF(b, wx) * R);
+        if (y >= Math.round((baseSurf(dq + wx) - rampH(dq + wx)) * R)) continue;
+        pset(sx, y + oy, C_MAG);
+      }
+      y = Math.round(beamYF(b, (FW - 1 - ox) / R) * R) + oy;
+      for (j = 0; j < 3; j++) { pset(FW - 3 - j, y - 3 + j, C_MAG); pset(FW - 3 - j, y + 3 - j, C_MAG); pset(FW - 2 - j, y - 3 + j, C_MAG); pset(FW - 2 - j, y + 3 - j, C_MAG); }
+      pset(FW - 6, y, C_MAG);
+      continue;
+    }
+    var th = beamTh(b, t);
+    if (th <= 0) continue;
+    var rows = BEAM_ROWS[th], n = rows.length, left = 0;
+    if (ft < 3) left = FW - (((FW + 16) * (ft + 1) / 3) | 0);  // 从右侧瞬间伸出
+    for (sx = FW - 1; sx >= left; sx--) {
+      wx = (sx - ox) / R;
+      var yc = Math.round(beamYF(b, wx) * R) + oy, surf = Math.round(baseSurf(dq + wx) * R) + oy, t0 = yc - th;
+      var jit = (sx > FW - 16 && ft < bDur[b]) ? JIT[(realFrame + (sx >> 1)) & 7] : 0;  // 端部微微抖动
+      for (j = 0; j < n; j++) {
+        y = t0 + j;
+        if (y >= surf) break;
+        if ((j === 0 || j === n - 1) && ((sx * 7 + realFrame * 3) % 13) === 0) continue;
+        pset(sx, y + (j === 0 ? -(jit > 0 ? 1 : 0) : 0), rows[j]);
+      }
+      if (jit !== 0 && th > 2 && t0 + n < surf) pset(sx, t0 + n, C_CYAN);
+    }
+    if (ft < bDur[b]) {                                        // 发射口光晕
+      var fy = Math.round(beamYF(b, (FW - 1 - ox) / R) * R) + oy, fr = 5 + (JIT[realFrame & 7] > 0 ? 1 : 0);
+      for (j = -fr; j <= fr; j++) for (var i2 = -fr; i2 <= fr; i2++) {
+        var d2 = i2 * i2 + j * j;
+        if (d2 <= fr * fr) pset(FW - 1 + i2, fy + j, d2 <= 5 ? C_WHITE : (d2 <= 14 ? C_BCYAN : C_CYAN));
+      }
+    }
+  }
+}
+function drawMeteors(ox, oy) {
+  for (var m = 0; m < MM; m++) {
+    if (mAct[m] !== 2) continue;
+    var si = sprIndex(mR[m]), r = MSPR_R[si], S = 2 * r + 1, spr = MSPR[si], swap = ((realFrame >> 2) + m) & 1;
+    var x0 = Math.round(mX[m] * R) - r + ox, y0 = Math.round(mY[m] * R) - r + oy;
+    for (var y = 0; y < S; y++) for (var x = 0; x < S; x++) {
+      var c = spr[y * S + x];
+      if (c === 255) continue;
+      if (swap && c === C_LAVAH) c = C_LAVA; else if (swap && c === C_LAVA) c = C_LAVAH;
+      pset(x0 + x, y0 + y, c);
+    }
+  }
+}
+function drawChar(ox, oy) {
+  var blink = ((realFrame + 40) % 230) < 7 ? 1 : 0;
+  composeSoya(blink);
+  var x0 = soyaFX + ox - COX, y0 = soyaFY + oy - COY, x, y, i;
+  var glow = glowT > 0 && (glowT > 14 || (glowT & 2)) ? glowSide : -1;
+  if (glow < 0 && mode === GS_PLAY && dashT >= 0 && dashT < DASH_IFRAMES && (realFrame & 2)) glow = 0;
+  if (glow >= 0) {                                             // 险些相撞：只在靠近障碍物的一侧描 1px 白边
+    var dx = glow === 2 ? -1 : (glow === 3 ? 1 : 0), dy = glow === 0 ? -1 : (glow === 1 ? 1 : 0);
+    for (y = cbY0; y < cbY1; y++) for (x = cbX0; x < cbX1; x++) {
+      i = y * CBW + x;
+      if (!cb[i]) continue;
+      var nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= CBW || ny >= CBH || !cb[ny * CBW + nx]) pset(x0 + nx, y0 + ny, C_WHITE);
+    }
+  }
+  for (y = cbY0; y < cbY1; y++) for (x = cbX0; x < cbX1; x++) {
+    var c = cb[y * CBW + x];
+    if (c) pset(x0 + x, y0 + y, c);
+  }
+}
+function drawWarp() {
+  var t = warpT, x, y;
+  if (t <= WARP_RESET + 1) { fb.fill(PAL[C_WHITE]); return; }
+  var p = (t - 9) / (WARP_LEN - 9);
+  for (y = 0; y < FH; y++) for (x = 0; x < FW; x++) {
+    if (t > 9 && BAYER[(y & 3) * 4 + (x & 3)] < p * 17) continue;
+    fb[y * FW + x] = PAL[HUE + ((((x + y * 2 + realFrame * 6) >> 4) % 7))];
+  }
+}
+function drawStageBanner(y, sc) {
+  var wS = textW('STAGE', sc), wN = numW(stage + 1, sc), x = ((FW - wS - 3 * sc - wN) / 2) | 0;
+  drawRainbow('STAGE', x, y, sc, realFrame >> 3);
+  drawNum(stage + 1, x + wS + 3 * sc, y, C_WHITE, sc, 1);
+}
+function drawHUD(ox, oy) {
+  if (nearPopT > 0) {                                          // 险些相撞提示
+    var px = Math.round(nearPopX * R) + ox, py = Math.round(nearPopY * R) + oy - ((40 - nearPopT) >> 1);
+    var col = (realFrame >> 1) & 1 ? C_WHITE : 13, w = textW('NEAR MISS', 1) + (nearPopN >= 2 ? 16 : 0);
+    var tx = px - (w >> 1); if (tx < 2) tx = 2; if (tx + w > FW - 2) tx = FW - 2 - w; if (py < 28) py = 28;
+    drawText('NEAR MISS', tx, py, col, 1, 1);
+    if (nearPopN >= 2) { drawText('x', tx + 56, py, 13, 1, 1); drawNum(nearPopN, tx + 62, py, 13, 1, 1); }
+  }
+  if (mode === GS_TITLE) return;
+  drawNum(scoreF, 6, 6, C_WHITE, 1, 1);
+  if (combo >= 2) { var cx = 6 + numW(scoreF, 1) + 6; drawText('x', cx, 6, 13, 1, 1); drawNum(combo, cx + 6, 6, 13, 1, 1); }
+  drawText('STAGE', 6, 17, C_STAR, 1, 1); drawNum(stage + 1, 42, 17, C_STAR, 1, 1);
+  var bw = numW(best, 1);
+  drawNum(best, FW - 6 - bw, 6, C_STAR, 1, 1); drawText('HI', FW - 6 - bw - 16, 6, C_STAR, 1, 1);
+  // 冲刺能量条
+  drawText('>', 6, 166, C_CYAN, 1, 1);
+  var ready = dashT < 0 && dashCD <= 0, fill = 28, i;
+  if (dashT >= 0) fill = 0; else if (dashCD > 0) fill = (28 * (DASH_CD - dashCD) / DASH_CD) | 0;
+  for (i = 0; i < 28; i++) {
+    var c = i < fill ? (ready ? ((((realFrame >> 2) + i) % 28) < 2 ? C_WHITE : C_BCYAN) : 22) : 3;
+    pset(15 + i, 168, c); pset(15 + i, 169, c); pset(15 + i, 170, c === C_BCYAN ? C_CYAN : c);
+  }
+  if (bannerT > 0 && mode === GS_PLAY && !paused && ((bannerT > 30) || (realFrame & 4))) {
+    drawStageBanner(40, 3);
+    if (stage === 0) drawTextC('GO!', 70, C_WHITE, 2, 1); else drawTextC('+500', 70, 13, 2, 1);
+  }
+}
+function drawOverlay() {
+  if (mode === GS_TITLE) {
+    dimRect(24, 4, 296, 96);
+    drawRainbowC('SOYA', 9, 4, realFrame >> 3);
+    drawTextC('RAINBOW DASH', 42, C_WHITE, 2, 1);
+    if (touchUI) {
+      drawTextC('RIGHT SIDE: JUMP  AGAIN: DOUBLE', 62, C_WHITE, 1, 1);
+      drawTextC('LEFT SIDE: SLIDE  SWIPE RIGHT: DASH', 72, C_WHITE, 1, 1);
+    } else {
+      drawTextC('UP/SPACE: JUMP  AGAIN: DOUBLE', 62, C_WHITE, 1, 1);
+      drawTextC('DOWN: SLIDE   RIGHT/SHIFT: DASH', 72, C_WHITE, 1, 1);
+    }
+    if ((realFrame >> 4) & 1) drawTextC(touchUI ? 'TAP TO START' : 'PRESS SPACE TO START', 85, 13, 1, 1);
+    if (best > 0) { var bw = textW('BEST ', 1) + numW(best, 1), bx = ((FW - bw) / 2) | 0; drawText('BEST', bx, 166, C_STAR, 1, 1); drawNum(best, bx + 30, 166, C_WHITE, 1, 1); }
+  } else if (mode === GS_OVER) {
+    dimRect(32, 20, 288, 134);
+    drawTextC('GAME OVER', 28, 11, 3, 1);
+    drawText('SCORE', 104, 64, C_STAR, 1, 1); drawNum(scoreF, 150, 64, C_WHITE, 1, 1);
+    drawText('BEST', 104, 78, C_STAR, 1, 1); drawNum(best, 150, 78, C_WHITE, 1, 1);
+    if (newBest && (realFrame & 8)) drawTextC('NEW BEST!', 94, 13, 1, 1);
+    if (overT > 30 && ((realFrame >> 4) & 1)) drawTextC(touchUI ? 'TAP TO RETRY' : 'SPACE TO RETRY', 114, C_WHITE, 1, 1);
+  }
+  if (paused) {
+    dimRect(0, 0, FW, FH);
+    drawTextC('PAUSED', 62, C_WHITE, 3, 1);
+    drawTextC(touchUI ? 'TAP TO RESUME' : 'P TO RESUME', 100, C_STAR, 1, 1);
+  }
+}
+function render() {
+  fb.set(bgBuf);
+  var si = shakeT > 0 ? (shakeT % 10) * 2 : -1, amp = shakeT > 5 ? shakeAmp : 1;
+  var shX = si >= 0 ? SHAKE[si] * amp * R : 0, shY = si >= 0 ? SHAKE[si + 1] * amp * R : 0;
+  var ox = -Math.round(camXf * R) + shX, oy = -Math.round(camYf * R) + shY;
+  var inPit = alive && h < -1;
+  drawSky(shX, shY);
+  if (inPit) drawChar(ox, oy);                                 // 掉进断裂时在地板后面
+  drawFloor(ox, oy);
+  drawParticles(ox, oy);
+  drawBeams(ox, oy);
+  drawMeteors(ox, oy);
+  if (alive && !inPit) drawChar(ox, oy);
+  if (warpT >= 0) drawWarp();
+  if (flashT > 0) fb.fill(PAL[C_WHITE]);
+  drawHUD(ox, oy);
+  drawOverlay();
+}
+
+/* ================= 启动 ================= */
+try { best = parseInt(window.localStorage.getItem('soyaRainbowDashBest'), 10) || 0; } catch (e) { best = 0; }
+solve();
+var api = {
+  solve: solve, resetWorld: resetWorld, step: step, tickReal: tickReal, render: render, report: solveReport,
+  startGame: startGame, fb: fb, W: FW, H: FH, R: R, aStart: aStart, patMin: patMin,
+  input: function (j, jh, d, ds, dh) { if (j) jumpBuf = j; jumpHeld = jh; downHeld = d; if (ds) dashBuf = ds; dashHeld = dh; },
+  get: function () { return { mode: mode, tick: tick, lastTick: lastTick, alive: alive, h: h, score: scoreF, stage: stage, warpT: warpT, grounded: grounded, dashT: dashT, fell: fell, combo: combo, pose: pose, anchorX: anchorX, anchorY: anchorY, box: [bx0, bx1, by0, by1] }; }
+};
+if (typeof document === 'undefined') return api;
+
+var disp = document.getElementById('screen'), dctx = disp.getContext('2d');
+var off = document.createElement('canvas'); off.width = FW; off.height = FH;
+var octx = off.getContext('2d'), img = octx.createImageData(FW, FH);
+var img32 = new Uint32Array(img.data.buffer);
+var sc = 1, offX = 0, offY = 0;
+touchUI = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0) ? 1 : 0;
+function resize() {
+  var dpr = window.devicePixelRatio || 1;
+  var cw = Math.max(1, Math.floor(window.innerWidth * dpr)), ch = Math.max(1, Math.floor(window.innerHeight * dpr));
+  disp.width = cw; disp.height = ch;
+  disp.style.width = (cw / dpr) + 'px'; disp.style.height = (ch / dpr) + 'px';
+  sc = Math.max(1, Math.floor(Math.min(cw / FW, ch / FH)));
+  offX = Math.floor((cw - FW * sc) / 2); offY = Math.floor((ch - FH * sc) / 2);
+  dctx.imageSmoothingEnabled = false;
+  dctx.fillStyle = '#000'; dctx.fillRect(0, 0, cw, ch);
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* 键盘 */
+function onKey(e, down) {
+  var c = e.code;
+  var isJump = c === 'Space' || c === 'ArrowUp' || c === 'KeyW' || c === 'KeyZ' || c === 'KeyK' || c === 'Enter';
+  var isDown = c === 'ArrowDown' || c === 'KeyS' || c === 'KeyJ';
+  var isDash = c === 'ArrowRight' || c === 'KeyD' || c === 'ShiftLeft' || c === 'ShiftRight' || c === 'KeyX' || c === 'KeyL';
+  var isPause = c === 'KeyP' || c === 'Escape';
+  if (isJump || isDown || isDash || isPause) e.preventDefault();
+  if (!down) {
+    if (isJump) jumpHeld = 0;
+    if (isDown) downHeld = 0;
+    if (isDash) dashHeld = 0;
+    return;
+  }
+  if (mode === GS_TITLE) { if (isJump && !e.repeat) startGame(); return; }
+  if (mode === GS_OVER) {
+    if (c === 'Escape') toTitle();
+    else if (isJump && !e.repeat && overT > 30) startGame();
+    return;
+  }
+  if (isPause) { if (mode === GS_PLAY) paused = paused ? 0 : 1; return; }
+  if (paused) { if (isJump && !e.repeat) paused = 0; return; }
+  if (mode !== GS_PLAY) return;
+  if (isJump) { if (!e.repeat) jumpBuf = 6; jumpHeld = 1; }
+  if (isDown) downHeld = 1;
+  if (isDash) { if (!e.repeat) dashBuf = 4; dashHeld = 1; }
+}
+window.addEventListener('keydown', function (e) { onKey(e, 1); });
+window.addEventListener('keyup', function (e) { onKey(e, 0); });
+
+/* 触摸 / 鼠标：右半屏跳跃（按住跳更高），左半屏滑行，左半屏向右滑动冲刺 */
+var slideId = -1, jumpId = -1, dashId = -1, sx0 = 0;
+disp.addEventListener('pointerdown', function (e) {
+  e.preventDefault();
+  if (mode === GS_TITLE) { startGame(); return; }
+  if (mode === GS_OVER) { if (overT > 30) startGame(); return; }
+  if (paused) { paused = 0; return; }
+  if (mode !== GS_PLAY) return;
+  if (e.clientX < window.innerWidth * 0.5) { slideId = e.pointerId; sx0 = e.clientX; downHeld = 1; }
+  else { jumpId = e.pointerId; jumpBuf = 6; jumpHeld = 1; }
+});
+disp.addEventListener('pointermove', function (e) {
+  if (e.pointerId === slideId && e.clientX - sx0 > 28) {
+    slideId = -1; downHeld = 0; dashId = e.pointerId; dashBuf = 4; dashHeld = 1;
+  }
+});
+function onPointerEnd(e) {
+  if (e.pointerId === slideId) { slideId = -1; downHeld = 0; }
+  if (e.pointerId === jumpId) { jumpId = -1; jumpHeld = 0; }
+  if (e.pointerId === dashId) { dashId = -1; dashHeld = 0; }
+}
+disp.addEventListener('pointerup', onPointerEnd);
+disp.addEventListener('pointercancel', onPointerEnd);
+disp.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+function autoPause() { if (mode === GS_PLAY) paused = 1; jumpHeld = 0; downHeld = 0; dashHeld = 0; }
+window.addEventListener('blur', autoPause);
+document.addEventListener('visibilitychange', function () { if (document.hidden) autoPause(); });
+
+var STEP_MS = 1000 / 60, acc = 0, lastTs = 0;
+function frame(ts) {
+  var d = lastTs ? ts - lastTs : STEP_MS;
+  lastTs = ts;
+  if (d > 250) d = STEP_MS;
+  acc += d;
+  var n = 0;
+  while (acc >= STEP_MS - 2 && n < 4) { tickReal(); acc -= STEP_MS; n++; }
+  if (n === 4 && acc > STEP_MS) acc = 0;
+  render();
+  img32.set(fb);
+  octx.putImageData(img, 0, 0);
+  dctx.imageSmoothingEnabled = false;
+  dctx.drawImage(off, 0, 0, FW, FH, offX, offY, FW * sc, FH * sc);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+return api;
+})();
+</script>
+</body>
+</html>
